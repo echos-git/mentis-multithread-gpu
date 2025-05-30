@@ -68,7 +68,15 @@ class ProgressTracker:
         if self.progress_file.exists():
             try:
                 with open(self.progress_file, 'r') as f:
-                    return json.load(f)
+                    progress = json.load(f)
+                    
+                # Convert lists back to sets (JSON doesn't support sets)
+                if "processed_files" in progress and isinstance(progress["processed_files"], list):
+                    progress["processed_files"] = set(progress["processed_files"])
+                if "failed_files" in progress and isinstance(progress["failed_files"], list):
+                    progress["failed_files"] = set(progress["failed_files"])
+                    
+                return progress
             except Exception:
                 pass
         
