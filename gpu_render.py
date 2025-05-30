@@ -20,6 +20,13 @@ from pyvista.plotting.lights import LightType
 from gpu_config import CONFIG
 from gpu_memory import get_gpu_manager
 
+# Constants for lighting system
+NUM_LIGHTS_PER_VIEW = 3
+THETA_CONE_DEGREES = 55.0
+THETA_CONE_RADIANS = np.radians(THETA_CONE_DEGREES)
+LIGHT_INTENSITY = 0.5
+LIGHTING_MULTIPLIER = 2
+
 
 class GPUCanonicalViews:
     """Manages canonical viewpoint calculations for 3D meshes."""
@@ -79,12 +86,16 @@ class GPULightingSystem:
     """GPU-optimized lighting calculations for rendering."""
     
     # Lighting constants from original system
-    THETA_CONE_DEGREES = 55.0
-    THETA_CONE_RADIANS = np.radians(THETA_CONE_DEGREES)
-    LIGHT_INTENSITY = 0.5
-    NUM_LIGHTS_PER_VIEW = 3
-    LIGHTING_MULTIPLIER = 2
-    AZIMUTH_ANGLES_RAD = [i * (2 * np.pi / NUM_LIGHTS_PER_VIEW) for i in range(NUM_LIGHTS_PER_VIEW)]
+    THETA_CONE_DEGREES = THETA_CONE_DEGREES
+    THETA_CONE_RADIANS = THETA_CONE_RADIANS
+    LIGHT_INTENSITY = LIGHT_INTENSITY
+    NUM_LIGHTS_PER_VIEW = NUM_LIGHTS_PER_VIEW
+    LIGHTING_MULTIPLIER = LIGHTING_MULTIPLIER
+    
+    @classmethod
+    def get_azimuth_angles(cls):
+        """Get azimuth angles for lighting."""
+        return [i * (2 * np.pi / cls.NUM_LIGHTS_PER_VIEW) for i in range(cls.NUM_LIGHTS_PER_VIEW)]
     
     @classmethod
     def calculate_lights_for_view(cls, camera_view_params: Tuple, base_intensity: float) -> List[pv.Light]:
@@ -122,7 +133,8 @@ class GPULightingSystem:
         y_vec = y_vec / np.linalg.norm(y_vec)
         
         # Create lights
-        for phi_azimuth in cls.AZIMUTH_ANGLES_RAD:
+        azimuth_angles = cls.get_azimuth_angles()
+        for phi_azimuth in azimuth_angles:
             lx_local = np.sin(cls.THETA_CONE_RADIANS) * np.cos(phi_azimuth)
             ly_local = np.sin(cls.THETA_CONE_RADIANS) * np.sin(phi_azimuth)
             lz_local = np.cos(cls.THETA_CONE_RADIANS)

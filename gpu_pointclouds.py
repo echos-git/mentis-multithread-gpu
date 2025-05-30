@@ -19,8 +19,10 @@ except ImportError:
 try:
     import torch
     TORCH_AVAILABLE = True
+    TorchTensor = torch.Tensor
 except ImportError:
     TORCH_AVAILABLE = False
+    TorchTensor = None
 
 import trimesh
 import pyvista as pv
@@ -244,8 +246,11 @@ class GPUPointCloudGenerator:
         
         return areas
     
-    def _calculate_face_areas_pytorch(self, vertices: torch.Tensor, faces: torch.Tensor) -> torch.Tensor:
+    def _calculate_face_areas_pytorch(self, vertices, faces):
         """Calculate face areas using PyTorch."""
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch not available")
+            
         # Get face vertices
         v0 = vertices[faces[:, 0]]
         v1 = vertices[faces[:, 1]]
@@ -286,10 +291,13 @@ class GPUPointCloudGenerator:
         return points
     
     def _sample_points_in_faces_pytorch(self, 
-                                       vertices: torch.Tensor, 
-                                       faces: torch.Tensor, 
-                                       face_indices: torch.Tensor) -> torch.Tensor:
+                                       vertices, 
+                                       faces, 
+                                       face_indices):
         """Sample random points within triangular faces using PyTorch."""
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch not available")
+            
         # Get vertices of selected faces
         selected_faces = faces[face_indices]
         v0 = vertices[selected_faces[:, 0]]
