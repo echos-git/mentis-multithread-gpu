@@ -190,7 +190,7 @@ def collect_dataset_files(data_dir: str, start_batch: int = 0,
     all_files = []
     batch_dirs = sorted(train_dir.glob("batch_*"))
     
-    # Filter by batch range
+    # Filter by batch range - handle both batch_XX and batch_X formats
     if end_batch is not None:
         batch_dirs = [b for b in batch_dirs if start_batch <= int(b.name.split('_')[1]) <= end_batch]
     else:
@@ -210,10 +210,17 @@ def process_single_file(file_path: str, output_base_dir: str,
     start_time = time.time()
     
     try:
+        # Determine which batch this file belongs to
+        file_path_obj = Path(file_path)
+        batch_name = file_path_obj.parent.name  # e.g., "batch_00"
+        
+        # Create batch-specific output directory: output_dir/batch_XX_processed/
+        batch_output_dir = Path(output_base_dir) / f"{batch_name}_processed"
+        
         # Process the file - this will create all outputs in structured directories
         result = full_pipeline_worker_gpu(
             cadquery_file_path=file_path,
-            output_base_dir=output_base_dir,
+            output_base_dir=str(batch_output_dir),
             n_points=num_points,
             use_global_lighting=False,
             force_overwrite=True,
@@ -259,6 +266,7 @@ def process_single_file(file_path: str, output_base_dir: str,
             return {
                 "success": True,
                 "file_path": file_path,
+                "batch_name": batch_name,
                 "processing_time": processing_time,
                 "file_sizes": file_sizes,
                 "outputs": {
@@ -274,6 +282,7 @@ def process_single_file(file_path: str, output_base_dir: str,
             return {
                 "success": False,
                 "file_path": file_path,
+                "batch_name": batch_name,
                 "processing_time": processing_time,
                 "error": result.error,
                 "pipeline_results": result.data.get('pipeline_results', {}) if result.data else {}
@@ -281,9 +290,16 @@ def process_single_file(file_path: str, output_base_dir: str,
             
     except Exception as e:
         processing_time = time.time() - start_time
+        # Try to get batch name even if processing failed
+        try:
+            batch_name = Path(file_path).parent.name
+        except:
+            batch_name = "unknown"
+            
         return {
             "success": False,
             "file_path": file_path,
+            "batch_name": batch_name,
             "processing_time": processing_time,
             "error": str(e),
             "traceback": traceback.format_exc()
