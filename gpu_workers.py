@@ -20,6 +20,9 @@ from gpu_memory import get_gpu_manager, cleanup_gpu_resources
 from gpu_pointclouds import GPUPointCloudGenerator
 from gpu_render import GPUBatchRenderer
 
+# Import CadQuery execution functions
+from cadquerytostl import execute_cadquery_file, export_stl
+
 
 @dataclass
 class TaskResult:
@@ -404,6 +407,9 @@ def full_pipeline_worker_gpu(file_path: str,
     from pathlib import Path
     import time
     import traceback
+    
+    # Initialize logger for this function
+    logger = logging.getLogger(__name__)
     
     # Single GPU manager instance for entire pipeline
     gpu_manager = None

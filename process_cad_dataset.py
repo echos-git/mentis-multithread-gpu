@@ -205,6 +205,9 @@ def collect_dataset_files(data_dir: str, start_batch: int = 0,
 def process_single_file(file_path: str, output_dir: str, config: Dict[str, Any]) -> Dict[str, Any]:
     """Process a single CAD file with the unified GPU pipeline."""
     try:
+        # Import the worker function
+        from gpu_workers import full_pipeline_worker_gpu
+        
         # Call unified pipeline worker with correct signature
         result = full_pipeline_worker_gpu(
             file_path=file_path,
@@ -258,10 +261,24 @@ def process_batch(files: List[str], output_dir: str, tracker: ProgressTracker,
                 
                 if result["success"]:
                     batch_results["successful"] += 1
+                    
+                    # Calculate file sizes from result
+                    file_sizes = {}
+                    if "stl_path" in result and Path(result["stl_path"]).exists():
+                        file_sizes["stl"] = Path(result["stl_path"]).stat().st_size
+                    if "pointcloud_path" in result and Path(result["pointcloud_path"]).exists():
+                        file_sizes["pointcloud"] = Path(result["pointcloud_path"]).stat().st_size
+                    if "render_results" in result:
+                        total_render_size = 0
+                        for view_path in result["render_results"].values():
+                            if Path(view_path).exists():
+                                total_render_size += Path(view_path).stat().st_size
+                        file_sizes["renders"] = total_render_size
+                    
                     tracker.add_processed_file(
                         file_path, 
                         result["processing_time"],
-                        result["file_sizes"]
+                        file_sizes
                     )
                     logger.info(f"✓ Processed {Path(file_path).name} in {result['processing_time']:.2f}s")
                 else:
