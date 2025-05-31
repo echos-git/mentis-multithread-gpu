@@ -206,80 +206,116 @@ def process_cad_file_sequentially(
             except ImportError:
                 RENDERING_POSSIBLE = False
                 logger.error("gpu_render.py not found or GPUBatchRenderer cannot be imported. Rendering will be skipped.")
-                # This is critical for the pipeline if renders are required.
                 raise RuntimeError("Rendering prerequisite (gpu_render.py) not available.")
 
-            # Define expected views to check for overwrite logic
             expected_views = [
                 'front', 'back', 'right', 'left', 'top', 'bottom', 
                 'above_ne', 'above_nw', 'above_se', 'above_sw',
                 'below_ne', 'below_nw', 'below_se', 'below_sw'
             ]
 
-            # Path where GPUBatchRenderer will create its own subdirectory based on stl_name
-            # So, if render_dir is my_outputs/my_cad/renders,
-            # and stl_name is my_cad, images will be in my_outputs/my_cad/renders/my_cad/*.png
-            renderer_specific_output_dir = render_dir / file_stem 
+            # render_dir is the TARGET directory for final images (e.g., .../my_model/renders/)
+            # renderer_source_output_dir is where GPUBatchRenderer will place files initially
+            # (e.g., .../my_model/renders/my_model/)
+            renderer_source_output_dir = render_dir / file_stem 
 
-            all_renders_exist = True
+            # Check if all renders already exist in the FINAL TARGET directory
+            all_renders_exist_in_target = True
             if not force_overwrite:
                 for view_name in expected_views:
-                    # Check the path where the renderer would place the file
-                    expected_render_path = renderer_specific_output_dir / f"{view_name}.png"
-                    if not expected_render_path.exists():
-                        all_renders_exist = False
+                    expected_target_path = render_dir / f"{view_name}.png"
+                    if not expected_target_path.exists():
+                        all_renders_exist_in_target = False
                         break
-                if all_renders_exist:
-                    logger.info(f"All {len(expected_views)} render files already exist in {renderer_specific_output_dir} and force_overwrite is False.")
-                    # Populate actual_render_results with existing paths
-                    for view_name in expected_views:
-                        actual_render_results[view_name] = str((renderer_specific_output_dir / f"{view_name}.png").resolve())
-                    actual_num_renders = len(expected_views)
             
-            if not all_renders_exist or force_overwrite:
-                logger.info(f"Rendering {len(expected_views)} views for {actual_stl_path.name} into {render_dir}")
+            if all_renders_exist_in_target and not force_overwrite:
+                logger.info(f"All {len(expected_views)} render files already exist in target {render_dir} and force_overwrite is False.")
+                for view_name in expected_views:
+                    actual_render_results[view_name] = str((render_dir / f"{view_name}.png").resolve())
+                actual_num_renders = len(expected_views)
+            else:
+                logger.info(f"Proceeding with rendering for {actual_stl_path.name}. Target: {render_dir}")
                 if not RENDERING_POSSIBLE:
                     raise RuntimeError("Cannot render: gpu_render module not available.")
+                
+                # Ensure the source directory for the renderer is clean if force_overwrite is true
+                if force_overwrite and renderer_source_output_dir.exists():
+                    for item in renderer_source_output_dir.iterdir():
+                        if item.is_file():
+                            item.unlink()
+                        elif item.is_dir(): # Should not happen with current renderer, but for safety
+                            import shutil
+                            shutil.rmtree(item)
+                renderer_source_output_dir.mkdir(parents=True, exist_ok=True) # Ensure it exists for renderer
+
                 try:
-                    # GPUBatchRenderer uses get_gpu_manager() for plotters
                     renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
                     
-                    # The output_base_dir for render_stl_multiview_gpu should be render_dir.
-                    # It will then create a subdirectory inside render_dir named file_stem.
-                    # So, images will be at: render_dir / file_stem / view_name.png
-                    # which translates to: base_output_dir / file_stem / renders / file_stem / view_name.png
+                    # GPUBatchRenderer output_base_dir is render_dir.
+                    # It will create a subdir file_stem within it: render_dir / file_stem / view.png
                     render_results_from_call = renderer.render_stl_multiview_gpu(
                         stl_path=str(actual_stl_path),
-                        output_base_dir=str(render_dir), # This will make it output to render_dir/file_stem/
+                        output_base_dir=str(render_dir), 
                         use_global_lighting=use_global_lighting,
-                        force_overwrite=force_overwrite # Renderer also has its own overwrite logic
+                        force_overwrite=force_overwrite 
                     )
 
                     if not render_results_from_call:
-                        raise RuntimeError("Rendering call returned no results.")
+                        # This case implies renderer itself decided not to produce results (e.g. all files existed in its view with its force_overwrite=False)
+                        # OR a more fundamental issue occurred within the renderer before it even attempted files.
+                        # If all_renders_exist_in_target was false, this means we expected rendering but got nothing.
+                        if not all_renders_exist_in_target:
+                            raise RuntimeError("Rendering call returned no results, but files were expected.")
+                        else: # This means files pre-existed in target, and renderer also found them pre-existing in its source (less likely scenario) or simply did nothing.
+                             logger.info("Renderer returned no results, assuming pre-existing files handled.")
+                             # Repopulate from target as a fallback if this path is hit unexpectedly.
+                             for view_name in expected_views:
+                                actual_render_results[view_name] = str((render_dir / f"{view_name}.png").resolve())
+                             actual_num_renders = len(expected_views)
 
-                    # Validate results and collect paths
-                    successful_renders = 0
-                    for view_name, G_PathStr in render_results_from_call.items():
-                        if "FAILED_RENDERING" not in G_PathStr and Path(G_PathStr).exists():
-                            actual_render_results[view_name] = str(Path(G_PathStr).resolve())
-                            successful_renders += 1
-                        else:
-                            logger.warning(f"View '{view_name}' failed to render or file not found: {G_PathStr}")
-                    
-                    actual_num_renders = successful_renders
-                    if actual_num_renders < len(expected_views):
-                        logger.warning(f"Expected {len(expected_views)} renders, but only {actual_num_renders} were successful.")
-                        # Decide if partial success is acceptable or should be an error
-                        # For now, accept partial if at least one render succeeded, but log warning.
-                        if actual_num_renders == 0: 
-                            raise RuntimeError("Rendering produced no valid image files.")
-                    
-                    logger.info(f"Rendering completed. {actual_num_renders} views saved in {renderer_specific_output_dir}")
+                    temp_moved_results = {}
+                    successful_renders_count = 0
+                    if render_results_from_call: # If renderer provided a list of what it did
+                        for view_name, G_PathStr_source in render_results_from_call.items():
+                            source_file_path = Path(G_PathStr_source)
+                            if "FAILED_RENDERING" not in G_PathStr_source and source_file_path.exists():
+                                target_file_name = source_file_path.name 
+                                target_file_path = render_dir / target_file_name
 
+                                target_file_path.parent.mkdir(parents=True, exist_ok=True)
+                                if target_file_path.exists() and force_overwrite and target_file_path != source_file_path:
+                                    target_file_path.unlink()
+                                
+                                if source_file_path != target_file_path:
+                                    source_file_path.rename(target_file_path)
+                                
+                                temp_moved_results[view_name] = str(target_file_path.resolve())
+                                successful_renders_count += 1
+                            else:
+                                logger.warning(f"View '{view_name}' failed by renderer or source file not found: {G_PathStr_source}")
+                        
+                        actual_render_results = temp_moved_results
+                        actual_num_renders = successful_renders_count
+
+                    if actual_num_renders < len(expected_views) and (not all_renders_exist_in_target or force_overwrite):
+                        logger.warning(f"Expected {len(expected_views)} renders, but only {actual_num_renders} were successful post-processing.")
+                        if actual_num_renders == 0:
+                            raise RuntimeError("Rendering and post-processing produced no valid image files.")
+                    
+                    logger.info(f"Rendering and file placement completed. {actual_num_renders} views in {render_dir}")
+
+                    # Clean up the renderer's specific source output subdirectory if it's empty and different
+                    if renderer_source_output_dir.exists() and renderer_source_output_dir != render_dir:
+                        try:
+                            if not any(renderer_source_output_dir.iterdir()): # Check if empty
+                                renderer_source_output_dir.rmdir()
+                                logger.info(f"Cleaned up empty renderer source output subdirectory: {renderer_source_output_dir}")
+                        except OSError as e:
+                            logger.warning(f"Could not remove renderer source output subdirectory {renderer_source_output_dir}: {e}")
+                
                 except Exception as render_e:
-                    logger.error(f"Rendering failed for {actual_stl_path.name}: {render_e}")
-                    raise RuntimeError(f"Rendering failed: {render_e}") from render_e
+                    logger.error(f"Rendering process failed for {actual_stl_path.name}: {render_e}")
+                    raise RuntimeError(f"Rendering process failed: {render_e}") from render_e
         else:
             logger.warning("Skipping rendering as STL file was not available.")
 
