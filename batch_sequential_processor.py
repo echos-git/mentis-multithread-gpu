@@ -9,10 +9,11 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from tqdm import tqdm
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
 try:
-    from single_file_processor import process_cad_file_sequentially
+    from single_file_processor import process_cad_file_sequentially, DEFAULT_VIEWS
     SINGLE_FILE_PROCESSOR_AVAILABLE = True
 except ImportError as e:
     print(f"Critical Error: Could not import 'process_cad_file_sequentially' from 'single_file_processor.py'. Error: {e}")
@@ -31,7 +32,7 @@ except ImportError:
         logging.warning("cleanup_gpu_resources not available from gpu_memory.py.")
 
 
-def setup_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
+def setup_logging(log_dir: Path, log_level_arg: str = "INFO", quiet_mode: bool = False) -> logging.Logger:
     """Setup comprehensive logging for the batch process."""
     log_dir.mkdir(parents=True, exist_ok=True)
     
@@ -48,14 +49,18 @@ def setup_logging(log_dir: Path, log_level: str = "INFO") -> logging.Logger:
     file_handler.setFormatter(formatter)
     file_handler.setLevel(logging.DEBUG) 
     
-    # Console handler for important messages (INFO or user-defined level)
+    # Console handler
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setFormatter(formatter) # Using the same detailed formatter
-    try:
-        console_handler.setLevel(getattr(logging, log_level.upper()))
-    except AttributeError:
-        console_handler.setLevel(logging.INFO)
-        logging.warning(f"Invalid log level '{log_level}'. Defaulting to INFO for console.")
+    console_handler.setFormatter(formatter)
+    
+    if quiet_mode:
+        console_handler.setLevel(logging.CRITICAL) # Show only critical errors on console
+    else:
+        try:
+            console_handler.setLevel(getattr(logging, log_level_arg.upper()))
+        except AttributeError:
+            console_handler.setLevel(logging.INFO)
+            logging.warning(f"Invalid log level '{log_level_arg}'. Defaulting to INFO for console.")
 
     # Configure the root logger
     # Remove any existing handlers to avoid duplicate logs if script is re-run in same session (e.g. in IPython)
@@ -211,9 +216,10 @@ def main():
     parser.add_argument("--force-overwrite", action="store_true", help="Overwrite existing output files for each CadQuery file.")
     parser.add_argument("--use-global-lighting", action="store_true", help="Use global lighting for rendering instead of view-specific.")
     parser.add_argument("--resume", action="store_true", help="Resume processing from the last saved progress.")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Console logging level.")
+    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Console logging level. Overridden by --quiet for console output.")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process (for testing).")
     parser.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() // 2 if os.cpu_count() else 1), help="Number of parallel worker threads.")
+    parser.add_argument("--quiet", action="store_true", help="Suppress terminal log output (except critical errors). Detailed logs are still saved to file.")
 
     args = parser.parse_args()
 
@@ -222,7 +228,7 @@ def main():
 
     output_root_dir = Path(args.output_dir)
     log_dir = output_root_dir / "_batch_logs"
-    logger = setup_logging(log_dir, args.log_level)
+    logger = setup_logging(log_dir, args.log_level, args.quiet)
 
     # Call pv.start_xvfb() once here, before any threading
     try:
@@ -260,7 +266,7 @@ def main():
         files_to_process = all_cad_files
         logger.info(f"Starting new run. {len(files_to_process)} files to process.")
 
-    if args.max_files is not None:
+    if args.max_files is not None and args.max_files < len(files_to_process):
         files_to_process = files_to_process[:args.max_files]
         logger.info(f"Limiting processing to the first {len(files_to_process)} files due to --max-files argument.")
         
@@ -271,41 +277,27 @@ def main():
     overall_start_time = time.time()
 
     try:
-        # Use ThreadPoolExecutor for parallel processing
+        futures = {}
         with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-            futures = []
-            for i, cad_file_path_str in enumerate(files_to_process):
-                # Check if already processed in this run via tracker (though resume logic should handle prior runs)
-                # This is more of a safeguard if files_to_process list somehow had duplicates after resume logic
-                if cad_file_path_str in tracker.processed_files or cad_file_path_str in tracker.failed_files and args.resume:
-                    # If resuming, failed files are re-added to files_to_process. So, only skip if already processed.
-                    if cad_file_path_str in tracker.processed_files:
-                        logger.debug(f"Skipping already processed file (from current session tracker): {cad_file_path_str}")
-                        continue
-                
+            for cad_file_path in files_to_process:
                 future = executor.submit(
                     process_cad_file_sequentially,
-                    cad_script_path=cad_file_path_str,
+                    cad_script_path=cad_file_path,
                     base_output_dir=args.output_dir,
                     num_points=args.num_points,
                     image_size=image_size,
                     force_overwrite=args.force_overwrite,
                     use_global_lighting=args.use_global_lighting
                 )
-                futures.append(future)
+                futures[future] = cad_file_path
             
-            logger.info(f"Submitted {len(futures)} files to the thread pool with {args.num_workers} workers.")
+            logger.info(f"Submitted {len(files_to_process)} files to the thread pool with {args.num_workers} workers.")
 
             processed_count = 0
-            for future in as_completed(futures):
+            for future in tqdm(as_completed(futures), total=len(files_to_process), desc="Processing files", unit="file"):
                 processed_count += 1
-                # Extract original cad_file_path_str from how future was submitted if possible,
-                # or by matching future.result() with input params. 
-                # This is tricky as submit doesn't easily pass context back with future.
-                # A common pattern is to map future to its input:
-                # future_to_file = {executor.submit(...): file_path for file_path in files_to_process}
-                # And then: file_path = future_to_file[future]
-                # For simplicity now, result will contain the file_path.
+                cad_file_path = futures[future]
+                original_filename = os.path.basename(cad_file_path)
 
                 try:
                     result = future.result() # This will block until the specific future is done
