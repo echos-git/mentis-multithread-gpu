@@ -44,8 +44,7 @@ class CUDAMemoryPool:
         if CUPY_AVAILABLE:
             try:
                 # Configure CuPy memory pool
-                cp.cuda.MemoryPool().set_limit(size=self.max_size_mb * 1024 * 1024)
-                cp.cuda.MemoryPool().set_growth_policy('exponential')
+                self._configure_cupy_memory_pool()
                 self._initialized = True
                 self.logger.info(f"CuPy memory pool initialized: {self.max_size_mb}MB limit")
             except Exception as e:
@@ -60,6 +59,35 @@ class CUDAMemoryPool:
                 self.logger.info("PyTorch CUDA memory management initialized")
             except Exception as e:
                 self.logger.warning(f"Failed to initialize PyTorch CUDA: {e}")
+    
+    def _configure_cupy_memory_pool(self) -> bool:
+        """Configure CuPy memory pool for optimal GPU utilization."""
+        try:
+            import cupy
+            
+            # Get memory pool
+            mempool = cupy.get_default_memory_pool()
+            
+            # Set memory limit to 85% of available VRAM
+            total_memory = cupy.cuda.Device().mem_info[1]  # Total memory
+            limit = int(total_memory * 0.85)
+            mempool.set_limit(size=limit)
+            
+            # Try to set growth policy (newer CuPy versions)
+            try:
+                if hasattr(mempool, 'set_growth_policy'):
+                    mempool.set_growth_policy(cupy.cuda.memory.GROWTH_POLICY_LOG)
+                else:
+                    self.logger.debug("CuPy memory pool growth policy not available (older version)")
+            except AttributeError:
+                self.logger.debug("CuPy growth policy not supported in this version")
+            
+            self.logger.info(f"CuPy memory pool configured: {limit / 1024**3:.1f}GB limit")
+            return True
+            
+        except Exception as e:
+            self.logger.warning(f"Failed to initialize CuPy memory pool: {e}")
+            return False
     
     @contextmanager
     def cuda_context(self, device_id: int = 0):
@@ -249,54 +277,82 @@ class PyVistaGPUManager:
             self._plotter_usage.clear()
             
             # Global VTK cleanup
-            try:
-                pv.close_all()
+            self._vtk_cleanup()
+    
+    def _vtk_cleanup(self):
+        """Safe VTK cleanup that works across versions."""
+        try:
+            import vtk
+            
+            # Try modern VTK cleanup first
+            if hasattr(vtk, 'vtkGarbageCollector'):
+                gc_class = getattr(vtk, 'vtkGarbageCollector')
+                if hasattr(gc_class, 'DeferredCollectionPush'):
+                    gc_class.DeferredCollectionPush()
+                if hasattr(gc_class, 'DeferredCollectionPop'):
+                    gc_class.DeferredCollectionPop()
                 
-                # VTK garbage collection
-                import vtk
-                if hasattr(vtk, 'vtkGarbageCollector'):
-                    vtk.vtkGarbageCollector.CollectGarbage()
-                    
-            except Exception as e:
-                self.logger.warning(f"Error in global VTK cleanup: {e}")
+                # Try different garbage collection methods
+                if hasattr(gc_class, 'Collect'):
+                    gc_class.Collect()
+                elif hasattr(gc_class, 'CollectGarbage'):
+                    gc_class.CollectGarbage()  # Older versions
+                else:
+                    self.logger.debug("VTK garbage collection method not found")
+            
+            # Try render window cleanup
+            if hasattr(vtk, 'vtkRenderWindow'):
+                rw_class = getattr(vtk, 'vtkRenderWindow')
+                if hasattr(rw_class, 'GlobalWarningDisplayOff'):
+                    rw_class.GlobalWarningDisplayOff()
+            
+            self.logger.debug("VTK cleanup completed successfully")
+            
+        except Exception as e:
+            self.logger.warning(f"Error in VTK cleanup: {e}")
 
 
 class GPUResourceManager:
-    """Main GPU resource management class."""
+    """Centralized GPU resource management for the entire application."""
     
-    def __init__(self, config_manager=None):
-        self.logger = logging.getLogger(__name__)
+    _instance = None
+    _initialized = False
+    _cleanup_in_progress = False  # Prevent cleanup loops
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def __init__(self):
+        if not self._initialized:
+            self.logger = logging.getLogger(__name__)
+            self.cuda_pool = CUDAMemoryPool()
+            self.pyvista_manager = PyVistaGPUManager()
+            self._cleanup_hooks = []
+            self._atexit_registered = False
+            
+            # Register cleanup only once
+            if not self._atexit_registered:
+                import atexit
+                atexit.register(self._safe_cleanup)
+                self._atexit_registered = True
+            
+            self.__class__._initialized = True
+            self.logger.info("GPU Resource Manager initialized")
+    
+    def _safe_cleanup(self):
+        """Thread-safe cleanup that prevents loops."""
+        if self.__class__._cleanup_in_progress:
+            return  # Already cleaning up, avoid loops
         
-        # Import config here to avoid circular imports
-        if config_manager is None:
-            from gpu_config import CONFIG
-            self.config = CONFIG
-        else:
-            self.config = config_manager
-        
-        # Initialize memory and plotter managers
-        gpu_config = self.config.gpu_config
-        
-        # CUDA memory pool
-        vram_size_mb = gpu_config.get('vram_pool_size_mb', 1024)
-        self.cuda_pool = CUDAMemoryPool(
-            initial_size_mb=min(1024, vram_size_mb // 4),
-            max_size_mb=vram_size_mb
-        )
-        
-        # PyVista plotter manager
-        max_concurrent = gpu_config.get('max_concurrent_renders', 2)
-        self.pyvista_manager = PyVistaGPUManager(
-            max_plotters=max_concurrent,
-            plotter_reuse_limit=50
-        )
-        
-        # Process cleanup registry
-        self._cleanup_hooks = []
-        
-        # Register cleanup on process exit
-        import atexit
-        atexit.register(self.cleanup_all)
+        self.__class__._cleanup_in_progress = True
+        try:
+            self.cleanup_all()
+        except Exception as e:
+            print(f"Warning: Error in final cleanup: {e}")
+        finally:
+            self.__class__._cleanup_in_progress = False
     
     @contextmanager
     def gpu_context(self, device_id: int = 0):
@@ -359,21 +415,28 @@ class GPUResourceManager:
     
     def cleanup_all(self):
         """Clean up all GPU resources."""
-        self.logger.info("Cleaning up GPU resources")
-        
-        # Run custom cleanup hooks
-        for hook in self._cleanup_hooks:
-            try:
-                hook()
-            except Exception as e:
-                self.logger.warning(f"Error in cleanup hook: {e}")
-        
-        # Clean up managers
-        self.pyvista_manager.cleanup_all()
-        self.cuda_pool.free_memory()
-        
-        # Final garbage collection
-        gc.collect()
+        try:
+            self.logger.info("Cleaning up GPU resources")
+            
+            # Clean up PyVista plotters
+            for plotter_id in list(self.pyvista_manager._plotter_usage.keys()):
+                try:
+                    plotter = self.pyvista_manager._plotter_pool[plotter_id]
+                    if hasattr(plotter, 'close'):
+                        plotter.close()
+                    self.logger.debug(f"Cleaned up plotter {plotter_id}")
+                except Exception as e:
+                    self.logger.warning(f"Error cleaning plotter {plotter_id}: {e}")
+            
+            # Safe VTK cleanup
+            self.pyvista_manager._vtk_cleanup()
+            
+        except Exception as e:
+            self.logger.warning(f"Error in global VTK cleanup: {e}")
+        finally:
+            # Always attempt garbage collection
+            import gc
+            gc.collect()
     
     def register_cleanup_hook(self, cleanup_func):
         """Register a function to be called during cleanup."""

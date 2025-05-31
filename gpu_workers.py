@@ -390,87 +390,137 @@ def batch_rendering_worker_gpu(stl_file_paths: List[str],
         cleanup_gpu_worker_process()
 
 
-def full_pipeline_worker_gpu(cadquery_file_path: str,
-                            output_base_dir: str,
-                            n_points: int = 8192,
-                            use_global_lighting: bool = False,
+def full_pipeline_worker_gpu(file_path: str, 
+                            output_dir: str,
+                            num_points: int = 10000,
+                            image_size: Tuple[int, int] = (1024, 1024),
                             force_overwrite: bool = False,
-                            device_id: int = 0) -> TaskResult:
+                            use_global_lighting: bool = False) -> Dict[str, Any]:
     """
-    Complete GPU-accelerated pipeline worker: CadQuery -> STL -> Point Cloud -> Renders.
+    Unified GPU pipeline worker that maintains single GPU context throughout processing.
+    CadQuery → STL → Point Clouds → 14-view Renders with shared GPU resources.
     """
-    start_time = time.time()
-    pipeline_results = {}
+    import os
+    from pathlib import Path
+    import time
+    import traceback
+    
+    # Single GPU manager instance for entire pipeline
+    gpu_manager = None
     
     try:
-        init_gpu_worker_process()
+        # Initialize GPU resources ONCE for entire pipeline
+        gpu_manager = get_gpu_manager()
+        logger.info(f"GPU worker process {os.getpid()} initialized")
         
-        # Setup paths
-        cq_name = Path(cadquery_file_path).stem
-        output_dir = Path(output_base_dir)
-        stl_dir = output_dir / "stls"
-        pointcloud_dir = output_dir / "pointclouds"
-        renders_dir = output_dir / "renders"
+        start_time = time.time()
+        py_file = Path(file_path)
+        file_stem = py_file.stem
+        
+        # Create output structure
+        file_output_dir = Path(output_dir) / file_stem
+        stl_dir = file_output_dir / "stls"
+        pointcloud_dir = file_output_dir / "pointclouds" 
+        render_dir = file_output_dir / "renders"
         
         # Create directories
-        for dir_path in [stl_dir, pointcloud_dir, renders_dir]:
+        for dir_path in [stl_dir, pointcloud_dir, render_dir]:
             dir_path.mkdir(parents=True, exist_ok=True)
         
-        # Step 1: Generate STL
-        stl_path = stl_dir / f"{cq_name}.stl"
-        stl_result = stl_generation_worker_gpu(cadquery_file_path, str(stl_path))
-        pipeline_results['stl'] = stl_result
+        # Step 1: CadQuery → STL (using shared GPU context)
+        stl_path = stl_dir / f"{file_stem}.stl"
+        if stl_path.exists() and not force_overwrite:
+            logger.debug(f"STL exists: {stl_path}")
+        else:
+            solid = execute_cadquery_file(str(py_file))
+            if solid is None:
+                raise ValueError("Failed to create solid from CadQuery file")
+            
+            export_stl(solid, str(stl_path))
+            if not stl_path.exists():
+                raise FileNotFoundError(f"STL export failed: {stl_path}")
         
-        if not stl_result.success:
-            raise RuntimeError(f"STL generation failed: {stl_result.error}")
+        # Step 2: STL → Point Cloud (using shared GPU context)
+        pointcloud_path = pointcloud_dir / f"{file_stem}.ply"
+        if pointcloud_path.exists() and not force_overwrite:
+            logger.debug(f"Point cloud exists: {pointcloud_path}")
+        else:
+            from gpu_pointclouds import GPUPointCloudGenerator
+            
+            # Use shared GPU context for point cloud generation
+            pc_generator = GPUPointCloudGenerator()
+            pc_result = pc_generator.generate_pointcloud_gpu(
+                str(stl_path), 
+                str(pointcloud_path),
+                num_points=num_points,
+                force_overwrite=force_overwrite
+            )
+            
+            if not pc_result.get('success', False):
+                raise RuntimeError(f"Point cloud generation failed: {pc_result.get('error', 'Unknown error')}")
         
-        # Step 2: Generate Point Cloud
-        pointcloud_path = pointcloud_dir / f"{cq_name}.npy"
-        pc_result = pointcloud_generation_worker_gpu(
-            str(stl_path), str(pointcloud_path), n_points, device_id
-        )
-        pipeline_results['pointcloud'] = pc_result
+        # Step 3: STL → 14 Renders (using shared GPU context)
+        from gpu_render import GPUBatchRenderer
         
-        # Step 3: Render Views (continue even if point cloud fails)
-        render_result = rendering_worker_gpu(
-            str(stl_path), str(renders_dir), use_global_lighting, force_overwrite, device_id
-        )
-        pipeline_results['rendering'] = render_result
+        # Create renderer using shared GPU context
+        renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
         
-        # Determine overall success
-        success = stl_result.success and render_result.success
-        # Point cloud failure is not fatal for the pipeline
+        # Check if renders already exist
+        expected_views = ['front', 'back', 'right', 'left', 'top', 'bottom', 
+                         'above_ne', 'above_nw', 'above_se', 'above_sw',
+                         'below_ne', 'below_nw', 'below_se', 'below_sw']
         
-        execution_time = time.time() - start_time
+        renders_exist = all((render_dir / f"{view}.png").exists() for view in expected_views)
         
-        return TaskResult(
-            success=success,
-            data={
-                'cadquery_path': cadquery_file_path,
-                'pipeline_results': pipeline_results,
-                'stl_path': str(stl_path) if stl_result.success else None,
-                'pointcloud_path': str(pointcloud_path) if pc_result.success else None,
-                'rendered_views': render_result.data.get('rendered_paths', {}) if render_result.success else {}
-            },
-            worker_pid=os.getpid(),
-            execution_time_s=execution_time
-        )
+        if renders_exist and not force_overwrite:
+            logger.debug(f"All renders exist for {file_stem}")
+            render_results = {view: str(render_dir / f"{view}.png") for view in expected_views}
+        else:
+            # Generate renders using shared GPU context
+            render_results = renderer.render_stl_multiview_gpu(
+                str(stl_path),
+                str(render_dir.parent),  # Base directory (renderer creates subdirs)
+                use_global_lighting=use_global_lighting,
+                force_overwrite=force_overwrite
+            )
+        
+        # Calculate processing time
+        processing_time = time.time() - start_time
+        
+        # Prepare results
+        result = {
+            'success': True,
+            'file': str(py_file),
+            'stl_path': str(stl_path),
+            'pointcloud_path': str(pointcloud_path),
+            'render_results': render_results,
+            'processing_time': processing_time,
+            'num_renders': len(render_results),
+            'output_dir': str(file_output_dir)
+        }
+        
+        logger.debug(f"✓ Completed {file_stem} in {processing_time:.2f}s")
+        return result
         
     except Exception as e:
-        execution_time = time.time() - start_time
-        return TaskResult(
-            success=False,
-            error=f"Full pipeline failed: {str(e)}",
-            data={
-                'cadquery_path': cadquery_file_path,
-                'pipeline_results': pipeline_results,
-                'traceback': traceback.format_exc()
-            },
-            worker_pid=os.getpid(),
-            execution_time_s=execution_time
-        )
+        error_msg = f"Pipeline failed for {file_path}: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(f"Full traceback: {traceback.format_exc()}")
+        
+        return {
+            'success': False,
+            'file': str(file_path),
+            'error': error_msg,
+            'traceback': traceback.format_exc()
+        }
+    
     finally:
-        cleanup_gpu_worker_process()
+        # Single cleanup at end of entire pipeline
+        if gpu_manager:
+            try:
+                gpu_manager.cleanup()
+            except Exception as e:
+                logger.warning(f"GPU cleanup warning: {e}")
 
 
 # Convenience wrapper functions

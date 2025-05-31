@@ -202,107 +202,27 @@ def collect_dataset_files(data_dir: str, start_batch: int = 0,
     
     return all_files
 
-def process_single_file(file_path: str, output_base_dir: str, 
-                       num_points: int = 10000) -> Dict[str, Any]:
-    """Process a single CadQuery file"""
-    from gpu_workers import full_pipeline_worker_gpu
-    
-    start_time = time.time()
-    
+def process_single_file(file_path: str, output_dir: str, config: Dict[str, Any]) -> Dict[str, Any]:
+    """Process a single CAD file with the unified GPU pipeline."""
     try:
-        # Determine which batch this file belongs to
-        file_path_obj = Path(file_path)
-        batch_name = file_path_obj.parent.name  # e.g., "batch_00"
-        
-        # Create batch-specific output directory: output_dir/batch_XX_processed/
-        batch_output_dir = Path(output_base_dir) / f"{batch_name}_processed"
-        
-        # Process the file - this will create all outputs in structured directories
+        # Call unified pipeline worker with correct signature
         result = full_pipeline_worker_gpu(
-            cadquery_file_path=file_path,
-            output_base_dir=str(batch_output_dir),
-            n_points=num_points,
-            use_global_lighting=False,
-            force_overwrite=True,
-            device_id=0
+            file_path=file_path,
+            output_dir=output_dir,
+            num_points=config.get('num_points', 5000),
+            image_size=config.get('image_size', (1024, 1024)),
+            force_overwrite=config.get('force_overwrite', False),
+            use_global_lighting=config.get('use_global_lighting', False)
         )
         
-        processing_time = time.time() - start_time
+        return result
         
-        if result.success:
-            # Get actual output paths from result data
-            stl_path = result.data.get('stl_path')
-            pointcloud_path = result.data.get('pointcloud_path')
-            rendered_views = result.data.get('rendered_views', {})
-            
-            # Calculate file sizes
-            file_sizes = {}
-            
-            if stl_path and Path(stl_path).exists():
-                file_sizes["stl"] = Path(stl_path).stat().st_size
-            else:
-                file_sizes["stl"] = 0
-                
-            if pointcloud_path and Path(pointcloud_path).exists():
-                file_sizes["pointcloud"] = Path(pointcloud_path).stat().st_size
-            else:
-                file_sizes["pointcloud"] = 0
-            
-            # Calculate total render file sizes
-            render_size = 0
-            render_count = 0
-            render_dir = None
-            
-            if rendered_views:
-                for view_name, view_path in rendered_views.items():
-                    if Path(view_path).exists():
-                        render_size += Path(view_path).stat().st_size
-                        render_count += 1
-                        if render_dir is None:
-                            render_dir = str(Path(view_path).parent)
-            
-            file_sizes["renders"] = render_size
-            
-            return {
-                "success": True,
-                "file_path": file_path,
-                "batch_name": batch_name,
-                "processing_time": processing_time,
-                "file_sizes": file_sizes,
-                "outputs": {
-                    "stl": stl_path,
-                    "pointcloud": pointcloud_path,
-                    "renders": render_dir,
-                    "render_count": render_count,
-                    "rendered_views": rendered_views
-                },
-                "pipeline_results": result.data.get('pipeline_results', {})
-            }
-        else:
-            return {
-                "success": False,
-                "file_path": file_path,
-                "batch_name": batch_name,
-                "processing_time": processing_time,
-                "error": result.error,
-                "pipeline_results": result.data.get('pipeline_results', {}) if result.data else {}
-            }
-            
     except Exception as e:
-        processing_time = time.time() - start_time
-        # Try to get batch name even if processing failed
-        try:
-            batch_name = Path(file_path).parent.name
-        except:
-            batch_name = "unknown"
-            
         return {
-            "success": False,
-            "file_path": file_path,
-            "batch_name": batch_name,
-            "processing_time": processing_time,
-            "error": str(e),
-            "traceback": traceback.format_exc()
+            'success': False,
+            'file': file_path,
+            'error': f"Process failed: {str(e)}",
+            'processing_time': 0
         }
 
 def process_batch(files: List[str], output_dir: str, tracker: ProgressTracker,
@@ -325,7 +245,7 @@ def process_batch(files: List[str], output_dir: str, tracker: ProgressTracker,
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         # Submit all files
         future_to_file = {
-            executor.submit(process_single_file, file_path, output_dir, num_points): file_path
+            executor.submit(process_single_file, file_path, output_dir, {'num_points': num_points}): file_path
             for file_path in files
         }
         
