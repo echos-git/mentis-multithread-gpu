@@ -160,7 +160,7 @@ def pointcloud_generation_worker_gpu(stl_file_path: str,
         generator = GPUPointCloudGenerator(device_id=device_id)
         points = generator.stl_to_pointcloud_gpu(stl_file_path, n_points=n_points)
         
-        # Save point cloud
+        # Save point cloud in PLY format
         np.save(pointcloud_output_path, points)
         
         # Verify output was created
@@ -453,15 +453,16 @@ def full_pipeline_worker_gpu(file_path: str,
             
             # Use shared GPU context for point cloud generation
             pc_generator = GPUPointCloudGenerator()
-            pc_result = pc_generator.generate_pointcloud_gpu(
+            points = pc_generator.stl_to_pointcloud_gpu(
                 str(stl_path), 
-                str(pointcloud_path),
-                num_points=num_points,
-                force_overwrite=force_overwrite
+                num_points
             )
             
-            if not pc_result.get('success', False):
-                raise RuntimeError(f"Point cloud generation failed: {pc_result.get('error', 'Unknown error')}")
+            # Save point cloud in PLY format
+            np.save(str(pointcloud_path), points)
+            
+            if not pointcloud_path.exists():
+                raise RuntimeError(f"Point cloud generation failed: {pointcloud_path} not created")
         
         # Step 3: STL → 14 Renders (using shared GPU context)
         from gpu_render import GPUBatchRenderer
@@ -532,11 +533,14 @@ def process_cadquery_file_gpu(cadquery_file_path: str,
                              output_base_dir: str,
                              n_points: int = 8192,
                              use_global_lighting: bool = False,
-                             force_overwrite: bool = False) -> TaskResult:
+                             force_overwrite: bool = False) -> Dict[str, Any]:
     """Convenience function to process a single CadQuery file through the full GPU pipeline."""
     return full_pipeline_worker_gpu(
-        cadquery_file_path, output_base_dir, n_points, 
-        use_global_lighting, force_overwrite
+        file_path=cadquery_file_path, 
+        output_dir=output_base_dir, 
+        num_points=n_points, 
+        use_global_lighting=use_global_lighting,
+        force_overwrite=force_overwrite
     )
 
 

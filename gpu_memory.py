@@ -419,14 +419,10 @@ class GPUResourceManager:
             self.logger.info("Cleaning up GPU resources")
             
             # Clean up PyVista plotters
-            for plotter_id in list(self.pyvista_manager._plotter_usage.keys()):
-                try:
-                    plotter = self.pyvista_manager._plotter_pool[plotter_id]
-                    if hasattr(plotter, 'close'):
-                        plotter.close()
-                    self.logger.debug(f"Cleaned up plotter {plotter_id}")
-                except Exception as e:
-                    self.logger.warning(f"Error cleaning plotter {plotter_id}: {e}")
+            self.pyvista_manager.cleanup_all()
+            
+            # Clean up CUDA memory
+            self.cuda_pool.free_memory()
             
             # Safe VTK cleanup
             self.pyvista_manager._vtk_cleanup()
