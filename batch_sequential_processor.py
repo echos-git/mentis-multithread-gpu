@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
 from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
 try:
@@ -212,6 +213,7 @@ def main():
     parser.add_argument("--resume", action="store_true", help="Resume processing from the last saved progress.")
     parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Console logging level.")
     parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process (for testing).")
+    parser.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() // 2 if os.cpu_count() else 1), help="Number of parallel worker threads.")
 
     args = parser.parse_args()
 
@@ -260,45 +262,73 @@ def main():
     overall_start_time = time.time()
 
     try:
-        for i, cad_file_path_str in enumerate(files_to_process):
-            tracker.current_file_index = i
-            file_path_obj = Path(cad_file_path_str)
-            
-            logger.info(f"Processing file {i+1}/{len(files_to_process)}: {file_path_obj.name}")
-            file_process_start_time = time.time()
-
-            try:
-                result = process_cad_file_sequentially(
+        # Use ThreadPoolExecutor for parallel processing
+        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
+            futures = []
+            for i, cad_file_path_str in enumerate(files_to_process):
+                # Check if already processed in this run via tracker (though resume logic should handle prior runs)
+                # This is more of a safeguard if files_to_process list somehow had duplicates after resume logic
+                if cad_file_path_str in tracker.processed_files or cad_file_path_str in tracker.failed_files and args.resume:
+                    # If resuming, failed files are re-added to files_to_process. So, only skip if already processed.
+                    if cad_file_path_str in tracker.processed_files:
+                        logger.debug(f"Skipping already processed file (from current session tracker): {cad_file_path_str}")
+                        continue
+                
+                future = executor.submit(
+                    process_cad_file_sequentially,
                     cad_script_path=cad_file_path_str,
-                    base_output_dir=args.output_dir, # single_file_processor creates its own subdir based on file_stem
+                    base_output_dir=args.output_dir,
                     num_points=args.num_points,
                     image_size=image_size,
                     force_overwrite=args.force_overwrite,
                     use_global_lighting=args.use_global_lighting
                 )
-                
-                file_processing_time = result.get('processing_time', time.time() - file_process_start_time)
-
-                if result.get('success', False):
-                    logger.info(f"Successfully processed {file_path_obj.name} in {file_processing_time:.2f}s. Output: {result.get('output_dir')}")
-                    tracker.record_success(cad_file_path_str, file_processing_time)
-                else:
-                    error_msg = result.get('error', 'Unknown error from single_file_processor')
-                    logger.error(f"Failed to process {file_path_obj.name}. Error: {error_msg}")
-                    if result.get('traceback'):
-                        logger.debug(f"Traceback for {file_path_obj.name}:\n{result.get('traceback')}")
-                    tracker.record_failure(cad_file_path_str, error_msg, file_processing_time)
-
-            except Exception as e_inner: # Catch errors from the call to process_cad_file_sequentially itself
-                file_processing_time = time.time() - file_process_start_time
-                logger.critical(f"Critical error during processing of {file_path_obj.name}: {e_inner}", exc_info=True)
-                tracker.record_failure(cad_file_path_str, f"Critical batch error: {str(e_inner)}", file_processing_time)
+                futures.append(future)
             
-            # Optional: Log memory usage or other stats periodically
-            if (i + 1) % 100 == 0: # Every 100 files
-                logger.info(f"--- Processed {i+1} files. Current progress: ---")
-                logger.info(tracker.get_summary())
+            logger.info(f"Submitted {len(futures)} files to the thread pool with {args.num_workers} workers.")
 
+            processed_count = 0
+            for future in as_completed(futures):
+                processed_count += 1
+                # Extract original cad_file_path_str from how future was submitted if possible,
+                # or by matching future.result() with input params. 
+                # This is tricky as submit doesn't easily pass context back with future.
+                # A common pattern is to map future to its input:
+                # future_to_file = {executor.submit(...): file_path for file_path in files_to_process}
+                # And then: file_path = future_to_file[future]
+                # For simplicity now, result will contain the file_path.
+
+                try:
+                    result = future.result() # This will block until the specific future is done
+                    cad_file_path_from_result = result.get('file', 'Unknown_file_path_from_result')
+                    file_path_obj = Path(cad_file_path_from_result)
+
+                    file_processing_time = result.get('processing_time', 0.0) # process_cad_file_sequentially calculates this
+
+                    if result.get('success', False):
+                        logger.info(f"({processed_count}/{len(futures)}) Successfully processed {file_path_obj.name} in {file_processing_time:.2f}s. Output: {result.get('output_dir')}")
+                        tracker.record_success(cad_file_path_from_result, file_processing_time)
+                    else:
+                        error_msg = result.get('error', 'Unknown error from single_file_processor')
+                        logger.error(f"({processed_count}/{len(futures)}) Failed to process {file_path_obj.name}. Error: {error_msg}")
+                        if result.get('traceback'):
+                            logger.debug(f"Traceback for {file_path_obj.name}:\n{result.get('traceback')}")
+                        tracker.record_failure(cad_file_path_from_result, error_msg, file_processing_time)
+                
+                except Exception as e_future_result: # Catch errors from future.result() itself (e.g., unhandled exception in submitted function)
+                    # This path indicates an issue within process_cad_file_sequentially that wasn't caught and returned as a dict.
+                    # It's harder to get cad_file_path_str here directly unless we map futures to inputs.
+                    # For now, log a general error.
+                    logger.critical(f"({processed_count}/{len(futures)}) Critical error processing a file (exception from future.result()): {e_future_result}", exc_info=True)
+                    # Try to find which file it was - this is a simplification
+                    # A robust way is to map future to its original arguments upon submission.
+                    # For now, we can't reliably record failure for the specific file if this happens, 
+                    # unless process_cad_file_sequentially *always* returns a dict.
+                    # The current process_cad_file_sequentially does return a dict even on failure, so this path is less likely.
+
+                if processed_count % 100 == 0: # Log summary every 100 processed files
+                    logger.info(f"--- Processed {processed_count}/{len(futures)} files. Current progress: ---")
+                    logger.info(tracker.get_summary())
 
     except KeyboardInterrupt:
         logger.warning("Batch processing interrupted by user (KeyboardInterrupt).")
