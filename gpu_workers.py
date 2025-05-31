@@ -21,7 +21,7 @@ from gpu_pointclouds import GPUPointCloudGenerator
 from gpu_render import GPUBatchRenderer
 
 # Import CadQuery execution functions
-from cadquerytostl import execute_cadquery_file, export_stl
+from cadquerytostl import cq_to_stl
 
 
 @dataclass
@@ -438,11 +438,9 @@ def full_pipeline_worker_gpu(file_path: str,
         if stl_path.exists() and not force_overwrite:
             logger.debug(f"STL exists: {stl_path}")
         else:
-            solid = execute_cadquery_file(str(py_file))
-            if solid is None:
-                raise ValueError("Failed to create solid from CadQuery file")
+            # Use cq_to_stl which handles both execution and export
+            cq_to_stl(str(py_file), str(stl_path))
             
-            export_stl(solid, str(stl_path))
             if not stl_path.exists():
                 raise FileNotFoundError(f"STL export failed: {stl_path}")
         
