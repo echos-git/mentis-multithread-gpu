@@ -6,11 +6,9 @@ import pyvista as pv
 from pathlib import Path
 from typing import Dict, Any, Tuple
 import json # For json.dumps in the main block
-import threading # Added for rendering lock
-
 # Global lock for PyVista rendering operations to prevent concurrent access issues
 # GLX context errors often arise from multiple threads using graphics resources simultaneously.
-_pyvista_render_lock = threading.Lock()
+# _pyvista_render_lock = threading.Lock() # REMOVED for multiprocessing
 
 # Attempt to import GPU utilities, but allow to fail gracefully if not immediately used
 # or if this processor is intended to be runnable in environments without full GPU setup.
@@ -82,6 +80,18 @@ def process_cad_file_sequentially(
     function_start_time = time.time()
 
     try:
+        # --- PyVista Xvfb Check (for multiprocessing) ---
+        # Ensure Xvfb is started for this process if not already.
+        # PyVista's start_xvfb is generally idempotent within a DISPLAY context.
+        # However, in multiprocessing, each process might need its own.
+        # We rely on PyVista's internal check or ensure DISPLAY is unique per process if needed.
+        if not hasattr(pv, '_xvfb_display_xauthority') or pv._xvfb_display_xauthority is None:
+            logger.debug("Xvfb not detected as started in this process, attempting to start.")
+            pv.start_xvfb()
+            logger.debug("Xvfb start attempt finished for this process.")
+        else:
+            logger.debug("Xvfb already detected as started in this process.")
+
         # --- 2.2 Path Management ---
         script_path_obj = Path(cad_script_path)
         base_output_dir_obj = Path(base_output_dir)
@@ -261,18 +271,18 @@ def process_cad_file_sequentially(
 
                 try:
                     # Acquire lock before rendering operations
-                    logger.debug(f"Thread {threading.get_ident()} acquiring render lock for {actual_stl_path.name}")
-                    with _pyvista_render_lock:
-                        logger.debug(f"Thread {threading.get_ident()} acquired render lock for {actual_stl_path.name}")
-                        renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
-                        
-                        render_results_from_call = renderer.render_stl_multiview_gpu(
-                            stl_path=str(actual_stl_path),
-                            output_base_dir=str(render_dir), 
-                            use_global_lighting=use_global_lighting,
-                            force_overwrite=force_overwrite 
-                        )
-                        logger.debug(f"Thread {threading.get_ident()} releasing render lock for {actual_stl_path.name}")
+                    # logger.debug(f"Thread {threading.get_ident()} acquiring render lock for {actual_stl_path.name}")
+                    # with _pyvista_render_lock: # REMOVED for multiprocessing
+                    #    logger.debug(f"Thread {threading.get_ident()} acquired render lock for {actual_stl_path.name}")
+                    renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
+                    
+                    render_results_from_call = renderer.render_stl_multiview_gpu(
+                        stl_path=str(actual_stl_path),
+                        output_base_dir=str(render_dir), 
+                        use_global_lighting=use_global_lighting,
+                        force_overwrite=force_overwrite 
+                    )
+                    # logger.debug(f"Thread {threading.get_ident()} releasing render lock for {actual_stl_path.name}")
                     # Lock is released automatically by exiting the 'with' block
 
                     if not render_results_from_call:

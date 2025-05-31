@@ -6,9 +6,10 @@ import logging
 import argparse
 import traceback
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Set
+from typing import List, Dict, Any, Optional, Set, Tuple
 from datetime import datetime, timedelta
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from multiprocessing import Pool, Manager
+from functools import partial
 from tqdm import tqdm
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
@@ -76,7 +77,7 @@ def setup_logging(log_dir: Path, log_level_arg: str = "INFO", quiet_mode: bool =
 
 
 class SequentialProgressTracker:
-    """Tracks processing progress for sequential batch jobs."""
+    """Tracks processing progress for batch jobs."""
     
     def __init__(self, output_dir: Path, resume: bool = False):
         self.output_dir = output_dir
@@ -230,15 +231,6 @@ def main():
     log_dir = output_root_dir / "_batch_logs"
     logger = setup_logging(log_dir, args.log_level, args.quiet)
 
-    # Call pv.start_xvfb() once here, before any threading
-    try:
-        import pyvista as pv
-        logger.info("Initializing PyVista Xvfb for headless rendering...")
-        pv.start_xvfb()
-        logger.info("PyVista Xvfb initialized.")
-    except Exception as e_pv_setup:
-        logger.error(f"Failed to initialize PyVista Xvfb: {e_pv_setup}. Rendering might fail.")
-
     logger.info("Starting Batch CAD Processor.")
     logger.info(f"  Data director(y/ies): {', '.join(args.data_dir)}")
     logger.info(f"  Output directory: {args.output_dir}")
@@ -281,63 +273,54 @@ def main():
 
     overall_start_time = time.time()
 
+    # Prepare partial function for process_cad_file_sequentially
+    # This is needed because Pool.map/imap only takes one iterable argument for the worker function.
+    # We set other relatively static arguments here.
+    process_func_partial = partial(
+        process_cad_file_sequentially,
+        base_output_dir=args.output_dir,
+        num_points=args.num_points,
+        image_size=image_size,
+        force_overwrite=args.force_overwrite,
+        use_global_lighting=args.use_global_lighting
+    )
+
     try:
-        futures = {}
-        with ThreadPoolExecutor(max_workers=args.num_workers) as executor:
-            for cad_file_path in files_to_process:
-                future = executor.submit(
-                    process_cad_file_sequentially,
-                    cad_script_path=cad_file_path,
-                    base_output_dir=args.output_dir,
-                    num_points=args.num_points,
-                    image_size=image_size,
-                    force_overwrite=args.force_overwrite,
-                    use_global_lighting=args.use_global_lighting
-                )
-                futures[future] = cad_file_path
+        # Use multiprocessing.Pool for parallel processing
+        with Pool(processes=args.num_workers) as pool:
+            logger.info(f"Submitted {len(files_to_process)} files to the multiprocessing pool with {args.num_workers} workers.")
             
-            logger.info(f"Submitted {len(files_to_process)} files to the thread pool with {args.num_workers} workers.")
-
+            results_iterator = pool.imap_unordered(process_func_partial, files_to_process)
+            
             processed_count = 0
-            for future in tqdm(as_completed(futures), total=len(files_to_process), desc="Processing files", unit="file"):
+            for result in tqdm(results_iterator, total=len(files_to_process), desc="Processing files", unit="file"):
                 processed_count += 1
-                cad_file_path = futures[future]
-                original_filename = os.path.basename(cad_file_path)
+                # The result dict directly comes from process_cad_file_sequentially
+                cad_file_path_from_result = result.get('file', 'Unknown_file_path_from_result')
+                file_path_obj = Path(cad_file_path_from_result)
 
-                try:
-                    result = future.result() # This will block until the specific future is done
-                    cad_file_path_from_result = result.get('file', 'Unknown_file_path_from_result')
-                    file_path_obj = Path(cad_file_path_from_result)
+                file_processing_time = result.get('processing_time', 0.0)
 
-                    file_processing_time = result.get('processing_time', 0.0) # process_cad_file_sequentially calculates this
-
-                    if result.get('success', False):
-                        logger.info(f"({processed_count}/{len(futures)}) Successfully processed {file_path_obj.name} in {file_processing_time:.2f}s. Output: {result.get('output_dir')}")
-                        tracker.record_success(cad_file_path_from_result, file_processing_time)
-                    else:
-                        error_msg = result.get('error', 'Unknown error from single_file_processor')
-                        logger.error(f"({processed_count}/{len(futures)}) Failed to process {file_path_obj.name}. Error: {error_msg}")
-                        if result.get('traceback'):
-                            logger.debug(f"Traceback for {file_path_obj.name}:\n{result.get('traceback')}")
-                        tracker.record_failure(cad_file_path_from_result, error_msg, file_processing_time)
+                if result.get('success', False):
+                    logger.info(f"({processed_count}/{len(files_to_process)}) Successfully processed {file_path_obj.name} in {file_processing_time:.2f}s. Output: {result.get('output_dir')}")
+                    tracker.record_success(cad_file_path_from_result, file_processing_time)
+                else:
+                    error_msg = result.get('error', 'Unknown error from single_file_processor')
+                    logger.error(f"({processed_count}/{len(files_to_process)}) Failed to process {file_path_obj.name}. Error: {error_msg}")
+                    if result.get('traceback'):
+                        logger.debug(f"Traceback for {file_path_obj.name}:\n{result.get('traceback')}")
+                    tracker.record_failure(cad_file_path_from_result, error_msg, file_processing_time)
                 
-                except Exception as e_future_result: # Catch errors from future.result() itself (e.g., unhandled exception in submitted function)
-                    # This path indicates an issue within process_cad_file_sequentially that wasn't caught and returned as a dict.
-                    # It's harder to get cad_file_path_str here directly unless we map futures to inputs.
-                    # For now, log a general error.
-                    logger.critical(f"({processed_count}/{len(futures)}) Critical error processing a file (exception from future.result()): {e_future_result}", exc_info=True)
-                    # Try to find which file it was - this is a simplification
-                    # A robust way is to map future to its original arguments upon submission.
-                    # For now, we can't reliably record failure for the specific file if this happens, 
-                    # unless process_cad_file_sequentially *always* returns a dict.
-                    # The current process_cad_file_sequentially does return a dict even on failure, so this path is less likely.
+                # No direct equivalent of future.exception() easily here unless we wrap calls,
+                # but process_cad_file_sequentially is designed to catch its own exceptions and return a dict.
 
                 if processed_count % 100 == 0: # Log summary every 100 processed files
-                    logger.info(f"--- Processed {processed_count}/{len(futures)} files. Current progress: ---")
+                    logger.info(f"--- Processed {processed_count}/{len(files_to_process)} files. Current progress: ---")
                     logger.info(tracker.get_summary())
 
     except KeyboardInterrupt:
-        logger.warning("Batch processing interrupted by user (KeyboardInterrupt).")
+        logger.warning("Batch processing interrupted by user (KeyboardInterrupt). Terminating pool...")
+        # Pool is automatically terminated/joined by the context manager (__exit__)
     except Exception as e_outer:
         logger.critical(f"An unexpected error occurred during batch processing: {e_outer}", exc_info=True)
     finally:
