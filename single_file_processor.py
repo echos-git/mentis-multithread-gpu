@@ -6,6 +6,11 @@ import pyvista as pv
 from pathlib import Path
 from typing import Dict, Any, Tuple
 import json # For json.dumps in the main block
+import threading # Added for rendering lock
+
+# Global lock for PyVista rendering operations to prevent concurrent access issues
+# GLX context errors often arise from multiple threads using graphics resources simultaneously.
+_pyvista_render_lock = threading.Lock()
 
 # Attempt to import GPU utilities, but allow to fail gracefully if not immediately used
 # or if this processor is intended to be runnable in environments without full GPU setup.
@@ -249,21 +254,22 @@ def process_cad_file_sequentially(
                 renderer_source_output_dir.mkdir(parents=True, exist_ok=True) # Ensure it exists for renderer
 
                 try:
-                    renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
-                    
-                    # GPUBatchRenderer output_base_dir is render_dir.
-                    # It will create a subdir file_stem within it: render_dir / file_stem / view.png
-                    render_results_from_call = renderer.render_stl_multiview_gpu(
-                        stl_path=str(actual_stl_path),
-                        output_base_dir=str(render_dir), 
-                        use_global_lighting=use_global_lighting,
-                        force_overwrite=force_overwrite 
-                    )
+                    # Acquire lock before rendering operations
+                    logger.debug(f"Thread {threading.get_ident()} acquiring render lock for {actual_stl_path.name}")
+                    with _pyvista_render_lock:
+                        logger.debug(f"Thread {threading.get_ident()} acquired render lock for {actual_stl_path.name}")
+                        renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
+                        
+                        render_results_from_call = renderer.render_stl_multiview_gpu(
+                            stl_path=str(actual_stl_path),
+                            output_base_dir=str(render_dir), 
+                            use_global_lighting=use_global_lighting,
+                            force_overwrite=force_overwrite 
+                        )
+                        logger.debug(f"Thread {threading.get_ident()} releasing render lock for {actual_stl_path.name}")
+                    # Lock is released automatically by exiting the 'with' block
 
                     if not render_results_from_call:
-                        # This case implies renderer itself decided not to produce results (e.g. all files existed in its view with its force_overwrite=False)
-                        # OR a more fundamental issue occurred within the renderer before it even attempted files.
-                        # If all_renders_exist_in_target was false, this means we expected rendering but got nothing.
                         if not all_renders_exist_in_target:
                             raise RuntimeError("Rendering call returned no results, but files were expected.")
                         else: # This means files pre-existed in target, and renderer also found them pre-existing in its source (less likely scenario) or simply did nothing.
