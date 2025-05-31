@@ -258,6 +258,9 @@ class GPUBatchRenderer:
             
             viewpoints = GPUCanonicalViews.calculate_viewpoints(mesh_center, mesh_bounds, mesh_length)
             
+            # Debug: Log viewpoint information
+            self.logger.info(f"Calculated {len(viewpoints)} viewpoints: {list(viewpoints.keys())}")
+            
             # Filter views if specified
             if views_to_render:
                 viewpoints = {k: v for k, v in viewpoints.items() if k in views_to_render}
@@ -383,8 +386,10 @@ class GPUBatchRenderer:
                         output_path = future.result()
                         if output_path:
                             results[view_name] = str(output_path)
+                            self.logger.debug(f"Successfully rendered view: {view_name}")
                         else:
                             results[view_name] = "FAILED_RENDERING"
+                            self.logger.warning(f"Failed to render view: {view_name} (returned None)")
                     except Exception as e:
                         self.logger.error(f"Failed to render view {view_name}: {e}")
                         results[view_name] = "FAILED_RENDERING"
