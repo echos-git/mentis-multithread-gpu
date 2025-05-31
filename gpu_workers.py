@@ -445,10 +445,13 @@ def full_pipeline_worker_gpu(file_path: str,
                 raise FileNotFoundError(f"STL export failed: {stl_path}")
         
         # Step 2: STL → Point Cloud (using shared GPU context)
-        pointcloud_path = pointcloud_dir / f"{file_stem}.ply"
+        pointcloud_path = pointcloud_dir / f"{file_stem}.npy"
+        logger.debug(f"Point cloud path: {pointcloud_path}")
+        
         if pointcloud_path.exists() and not force_overwrite:
             logger.debug(f"Point cloud exists: {pointcloud_path}")
         else:
+            logger.debug(f"Generating point cloud for {stl_path}")
             from gpu_pointclouds import GPUPointCloudGenerator
             
             # Use shared GPU context for point cloud generation
@@ -458,8 +461,12 @@ def full_pipeline_worker_gpu(file_path: str,
                 num_points
             )
             
-            # Save point cloud in PLY format
+            logger.debug(f"Generated {len(points)} points, saving to {pointcloud_path}")
+            
+            # Save point cloud in NPY format
             np.save(str(pointcloud_path), points)
+            
+            logger.debug(f"Saved point cloud, checking if file exists: {pointcloud_path.exists()}")
             
             if not pointcloud_path.exists():
                 raise RuntimeError(f"Point cloud generation failed: {pointcloud_path} not created")
@@ -523,7 +530,7 @@ def full_pipeline_worker_gpu(file_path: str,
         # Single cleanup at end of entire pipeline
         if gpu_manager:
             try:
-                gpu_manager.cleanup()
+                gpu_manager.cleanup_all()
             except Exception as e:
                 logger.warning(f"GPU cleanup warning: {e}")
 
