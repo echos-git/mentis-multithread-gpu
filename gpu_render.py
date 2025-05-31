@@ -203,7 +203,7 @@ class GPUBatchRenderer:
         # Get GPU configuration
         self.gpu_config = CONFIG.gpu_config
         self.max_concurrent_renders = self.gpu_config.get('max_concurrent_renders', 2)
-        self.batch_size_renders = self.gpu_config.get('batch_size_renders', 2)
+        self.batch_size_renders = self.gpu_config.get('batch_size_renders', 1)  # Reduced to 1 to avoid GLX issues
         
         # Thread pool for parallel rendering
         self.render_pool = ThreadPoolExecutor(max_workers=self.max_concurrent_renders)
@@ -369,30 +369,22 @@ class GPUBatchRenderer:
         for i in range(0, len(view_items), self.batch_size_renders):
             batch_views = view_items[i:i + self.batch_size_renders]
             
-            # Render batch of views in parallel
-            with ThreadPoolExecutor(max_workers=len(batch_views)) as executor:
-                future_to_view = {
-                    executor.submit(
-                        self._render_single_view_gpu,
+            # Render batch of views sequentially to avoid GLX errors
+            for view_name, camera_params in batch_views:
+                try:
+                    output_path = self._render_single_view_gpu(
                         mesh, view_name, camera_params, output_dir,
                         use_global_lighting, all_lights, force_overwrite
-                    ): view_name for view_name, camera_params in batch_views
-                }
-                
-                # Collect batch results
-                for future in as_completed(future_to_view):
-                    view_name = future_to_view[future]
-                    try:
-                        output_path = future.result()
-                        if output_path:
-                            results[view_name] = str(output_path)
-                            self.logger.debug(f"Successfully rendered view: {view_name}")
-                        else:
-                            results[view_name] = "FAILED_RENDERING"
-                            self.logger.warning(f"Failed to render view: {view_name} (returned None)")
-                    except Exception as e:
-                        self.logger.error(f"Failed to render view {view_name}: {e}")
+                    )
+                    if output_path:
+                        results[view_name] = str(output_path)
+                        self.logger.debug(f"Successfully rendered view: {view_name}")
+                    else:
                         results[view_name] = "FAILED_RENDERING"
+                        self.logger.warning(f"Failed to render view: {view_name} (returned None)")
+                except Exception as e:
+                    self.logger.error(f"Failed to render view {view_name}: {e}")
+                    results[view_name] = "FAILED_RENDERING"
         
         return results
     
