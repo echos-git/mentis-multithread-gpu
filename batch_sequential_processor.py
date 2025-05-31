@@ -208,7 +208,7 @@ def collect_cad_files(data_dir: str, file_extension=".py") -> List[str]:
 
 def main():
     parser = argparse.ArgumentParser(description="Batch process CadQuery files sequentially using single_file_processor.")
-    parser.add_argument("--data-dir", required=True, help="Path to the root directory containing CadQuery (.py) files.")
+    parser.add_argument("--data-dir", nargs='+', required=True, help="Path(s) to the root directory(ies) containing CadQuery (.py) files. Can specify multiple.")
     parser.add_argument("--output-dir", required=True, help="Root directory for all processed outputs.")
     parser.add_argument("--num-points", type=int, default=10000, help="Points per point cloud for each file.")
     parser.add_argument("--image-width", type=int, default=1024, help="Width of rendered images.")
@@ -239,8 +239,8 @@ def main():
     except Exception as e_pv_setup:
         logger.error(f"Failed to initialize PyVista Xvfb: {e_pv_setup}. Rendering might fail.")
 
-    logger.info("Starting Sequential Batch CAD Processor.")
-    logger.info(f"  Data directory: {args.data_dir}")
+    logger.info("Starting Batch CAD Processor.")
+    logger.info(f"  Data director(y/ies): {', '.join(args.data_dir)}")
     logger.info(f"  Output directory: {args.output_dir}")
     logger.info(f"  Force overwrite: {args.force_overwrite}")
     logger.info(f"  Resume: {args.resume}")
@@ -249,10 +249,15 @@ def main():
 
     tracker = SequentialProgressTracker(output_root_dir, args.resume)
     
-    all_cad_files = collect_cad_files(args.data_dir)
+    all_cad_files = []
+    for data_directory in args.data_dir:
+        all_cad_files.extend(collect_cad_files(data_directory))
+    
+    # Remove duplicates if multiple directories contained the same file paths (e.g. overlapping globs or repeated dirs)
+    all_cad_files = sorted(list(set(all_cad_files)))
 
     if not all_cad_files:
-        logger.info("No CadQuery files found to process. Exiting.")
+        logger.info("No CadQuery files found in the specified director(y/ies). Exiting.")
         sys.exit(0)
 
     files_to_process = []

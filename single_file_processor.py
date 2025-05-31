@@ -78,7 +78,7 @@ def process_cad_file_sequentially(
                 'traceback': str (full Python traceback)
             }
     """
-    logger = logging.getLogger(__name__)
+    logger = logging.getLogger(f"{__name__}.{Path(cad_script_path).stem}")
     function_start_time = time.time()
 
     try:
@@ -90,11 +90,17 @@ def process_cad_file_sequentially(
             raise FileNotFoundError(f"Input CadQuery script not found: {cad_script_path}")
 
         file_stem = script_path_obj.stem
-        file_specific_output_dir = base_output_dir_obj / file_stem
+        # filename_no_ext is already defined from cad_script_path
         
-        stl_dir = file_specific_output_dir / "stls"
-        pointcloud_dir = file_specific_output_dir / "pointclouds"
-        render_dir = file_specific_output_dir / "renders" # Target for final renders
+        # Ensure output directories exist
+        # Modified to include the parent directory name of the input file (e.g., 'batch_00')
+        # in the output path to avoid collisions when processing multiple input batches.
+        input_batch_dir_name = script_path_obj.parent.name 
+        output_sub_dir = base_output_dir_obj / input_batch_dir_name / file_stem
+        
+        stl_dir = output_sub_dir / "stls"
+        pointcloud_dir = output_sub_dir / "pointclouds"
+        render_dir = output_sub_dir / "renders" # Target for final renders
 
         # Create output directories
         stl_dir.mkdir(parents=True, exist_ok=True)
@@ -104,7 +110,7 @@ def process_cad_file_sequentially(
         stl_output_path = stl_dir / f"{file_stem}.stl"
         pointcloud_output_path = pointcloud_dir / f"{file_stem}.npy"
 
-        logger.info(f"Processing {script_path_obj.name} -> {file_specific_output_dir}")
+        logger.info(f"Processing {script_path_obj.name} -> {output_sub_dir}")
 
         # --- 2.3 PyVista Setup (Headless Rendering) ---
         # pv.start_xvfb() # Moved to batch processor main function
@@ -367,7 +373,7 @@ def process_cad_file_sequentially(
             'render_results': actual_render_results, 
             'processing_time': processing_time,
             'num_renders': actual_num_renders,
-            'output_dir': str(file_specific_output_dir.resolve())
+            'output_dir': str(output_sub_dir.resolve())
         }
 
     except Exception as e:
