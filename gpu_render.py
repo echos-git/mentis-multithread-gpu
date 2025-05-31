@@ -31,24 +31,6 @@ LIGHTING_MULTIPLIER = 2
 class GPUCanonicalViews:
     """Manages canonical viewpoint calculations for 3D meshes."""
     
-    # 14 canonical viewpoints as defined in the original system
-    CANONICAL_VIEWS = {
-        'front': ([0, -1, 0], [0, 0, 0], [0, 0, 1]),
-        'back': ([0, 1, 0], [0, 0, 0], [0, 0, 1]),
-        'left': ([-1, 0, 0], [0, 0, 0], [0, 0, 1]),
-        'right': ([1, 0, 0], [0, 0, 0], [0, 0, 1]),
-        'top': ([0, 0, 1], [0, 0, 0], [0, 1, 0]),
-        'bottom': ([0, 0, -1], [0, 0, 0], [0, 1, 0]),
-        'front_left': ([-1, -1, 0], [0, 0, 0], [0, 0, 1]),
-        'front_right': ([1, -1, 0], [0, 0, 0], [0, 0, 1]),
-        'back_left': ([-1, 1, 0], [0, 0, 0], [0, 0, 1]),
-        'back_right': ([1, 1, 0], [0, 0, 0], [0, 0, 1]),
-        'top_front': ([0, -1, 1], [0, 0, 0], [0, 0, 1]),
-        'top_back': ([0, 1, 1], [0, 0, 0], [0, 0, 1]),
-        'top_left': ([-1, 0, 1], [0, 0, 0], [0, 0, 1]),
-        'top_right': ([1, 0, 1], [0, 0, 0], [0, 0, 1]),
-    }
-    
     @classmethod
     def calculate_viewpoints(cls, mesh_center: Tuple[float, float, float], 
                            mesh_bounds: Tuple[float, ...], 
@@ -69,15 +51,51 @@ class GPUCanonicalViews:
         
         focal_point = tuple(c for c in mesh_center)
         
+        # Standard view up vectors
+        std_view_up = (0.0, 0.0, 1.0)
+        top_bottom_view_up = (0.0, 1.0, 0.0)
+        
+        # 6 orthogonal views
+        viewpoints_config = [
+            {"name": "front",  "pos_delta": (0, -view_distance, 0), "view_up": std_view_up},
+            {"name": "back",   "pos_delta": (0, +view_distance, 0), "view_up": std_view_up},
+            {"name": "right",  "pos_delta": (-view_distance, 0, 0), "view_up": std_view_up},
+            {"name": "left",   "pos_delta": (+view_distance, 0, 0), "view_up": std_view_up},
+            {"name": "top",    "pos_delta": (0, 0, +view_distance), "view_up": top_bottom_view_up},
+            {"name": "bottom", "pos_delta": (0, 0, -view_distance), "view_up": top_bottom_view_up},
+        ]
+        
+        # 8 corner/diagonal views
+        d_norm = view_distance / math.sqrt(3.0)
+        
+        corner_definitions = [
+            (1, 1, 1, "above_ne"), (-1, 1, 1, "above_nw"),
+            (1, -1, 1, "above_se"), (-1, -1, 1, "above_sw"),
+            (1, 1, -1, "below_ne"), (-1, 1, -1, "below_nw"),
+            (1, -1, -1, "below_se"), (-1, -1, -1, "below_sw"),
+        ]
+        
+        for dx_f, dy_f, dz_f, name in corner_definitions:
+            current_d_norm = d_norm
+            # Increase distance by 20% to zoom out for corner views
+            if name.startswith("above_") or name.startswith("below_"):
+                current_d_norm *= 1.2
+                
+            viewpoints_config.append({
+                "name": name,
+                "pos_delta": (dx_f * current_d_norm, dy_f * current_d_norm, dz_f * current_d_norm),
+                "view_up": std_view_up
+            })
+        
+        # Convert to camera parameters
         viewpoints = {}
-        for view_name, (direction, _, view_up) in cls.CANONICAL_VIEWS.items():
-            # Calculate camera position
-            camera_pos = tuple(
-                focal_point[i] + direction[i] * view_distance 
-                for i in range(3)
+        for vp_conf in viewpoints_config:
+            cam_pos = (
+                mesh_center[0] + vp_conf["pos_delta"][0],
+                mesh_center[1] + vp_conf["pos_delta"][1],
+                mesh_center[2] + vp_conf["pos_delta"][2]
             )
-            
-            viewpoints[view_name] = (camera_pos, focal_point, view_up)
+            viewpoints[vp_conf["name"]] = (cam_pos, focal_point, vp_conf["view_up"])
         
         return viewpoints
 
@@ -394,9 +412,14 @@ class GPUBatchRenderer:
                 # Clear any existing state
                 plotter.remove_all_lights()
                 
-                # Add mesh with normal-based coloring for better visualization
+                # Compute normals if they don't exist or to ensure they are point normals
+                mesh.compute_normals(point_normals=True, cell_normals=False, inplace=True)
+                
+                # Get point normals and convert to RGB colors
                 point_normals = mesh.point_normals
+                # Convert normals (range -1 to 1) to RGB colors (range 0 to 1)
                 rgb_colors = (point_normals + 1.0) / 2.0
+                # Clip to ensure values are strictly within [0, 1] range
                 rgb_colors = np.clip(rgb_colors, 0.0, 1.0)
                 
                 plotter.add_mesh(mesh, scalars=rgb_colors, rgb=True, smooth_shading=True)
