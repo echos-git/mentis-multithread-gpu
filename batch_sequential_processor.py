@@ -13,7 +13,7 @@ from tqdm import tqdm
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
 try:
-    from single_file_processor import process_cad_file_sequentially, DEFAULT_VIEWS
+    from single_file_processor import process_cad_file_sequentially
     SINGLE_FILE_PROCESSOR_AVAILABLE = True
 except ImportError as e:
     print(f"Critical Error: Could not import 'process_cad_file_sequentially' from 'single_file_processor.py'. Error: {e}")
