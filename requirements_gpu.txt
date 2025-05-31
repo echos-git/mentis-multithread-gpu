@@ -1,3 +1,4 @@
+--extra-index-url https://wheels.vtk.org
 # GPU Processing Requirements for CAD Pipeline
 # Core dependencies from original multithread module
 numpy>=1.21.0
@@ -18,8 +19,8 @@ pynvml>=11.4.1
 # Additional GPU utilities
 numba>=0.56.0  # JIT compilation for GPU kernels (optional)
 
-# VTK with GPU support (may need special build)
-vtk>=9.2.0
+# VTK with GPU support (may need special build) - Replaced by vtk-osmesa
+# vtk>=9.2.0
 
 # Development and testing
 pytest>=7.0.0
@@ -28,4 +29,7 @@ tqdm>=4.64.0
 
 # For Runpod environment
 matplotlib>=3.5.0
-pillow>=9.0.0 
+pillow>=9.0.0
+
+# OSMesa for headless rendering (replaces standard vtk)
+vtk-osmesa>=9.2.0 

@@ -80,17 +80,8 @@ def process_cad_file_sequentially(
     function_start_time = time.time()
 
     try:
-        # --- PyVista Xvfb Check (for multiprocessing) ---
-        # Ensure Xvfb is started for this process if not already.
-        # PyVista's start_xvfb is generally idempotent within a DISPLAY context.
-        # However, in multiprocessing, each process might need its own.
-        # We rely on PyVista's internal check or ensure DISPLAY is unique per process if needed.
-        if not hasattr(pv, '_xvfb_display_xauthority') or pv._xvfb_display_xauthority is None:
-            logger.debug("Xvfb not detected as started in this process, attempting to start.")
-            pv.start_xvfb()
-            logger.debug("Xvfb start attempt finished for this process.")
-        else:
-            logger.debug("Xvfb already detected as started in this process.")
+        # Set PyVista to off-screen mode (critical for headless operation with Xvfb or OSMesa)
+        pv.OFF_SCREEN = True
 
         # --- 2.2 Path Management ---
         script_path_obj = Path(cad_script_path)
@@ -123,8 +114,8 @@ def process_cad_file_sequentially(
         logger.info(f"Processing {script_path_obj.name} -> {output_sub_dir}")
 
         # --- 2.3 PyVista Setup (Headless Rendering) ---
-        # pv.start_xvfb() # Moved to batch processor main function
-        pv.OFF_SCREEN = True
+        # pv.start_xvfb() # REMOVED - OSMesa handles headless, or Xvfb was handled per-process before
+        # pv.OFF_SCREEN = True # Ensured at the top of the function
         # pv.set_plot_theme("document") # Optional: consider if it affects output
 
         # --- 2.4 GPU Resource Manager ---
