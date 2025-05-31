@@ -170,7 +170,10 @@ class PyVistaGPUManager:
     def __init__(self, max_plotters: int = 4, plotter_reuse_limit: int = 50):
         self.logger = logging.getLogger(f"{__name__}.PyVistaGPU")
         self.max_plotters = max_plotters
-        self.plotter_reuse_limit = plotter_reuse_limit
+        # Force plotter_reuse_limit to 0 (or 1) to ensure plotters are closed after each use.
+        # This might help with GLX context issues in threaded environments.
+        self.plotter_reuse_limit = 0 # Was plotter_reuse_limit
+        self.logger.info(f"PyVistaGPUManager initialized with max_plotters={self.max_plotters}, plotter_reuse_limit={self.plotter_reuse_limit}")
         
         self._plotter_pool: List[pv.Plotter] = []
         self._plotter_usage: Dict[int, int] = {}
