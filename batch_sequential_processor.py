@@ -7,7 +7,7 @@ import argparse
 import traceback
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Set
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
@@ -223,6 +223,15 @@ def main():
     output_root_dir = Path(args.output_dir)
     log_dir = output_root_dir / "_batch_logs"
     logger = setup_logging(log_dir, args.log_level)
+
+    # Call pv.start_xvfb() once here, before any threading
+    try:
+        import pyvista as pv
+        logger.info("Initializing PyVista Xvfb for headless rendering...")
+        pv.start_xvfb()
+        logger.info("PyVista Xvfb initialized.")
+    except Exception as e_pv_setup:
+        logger.error(f"Failed to initialize PyVista Xvfb: {e_pv_setup}. Rendering might fail.")
 
     logger.info("Starting Sequential Batch CAD Processor.")
     logger.info(f"  Data directory: {args.data_dir}")

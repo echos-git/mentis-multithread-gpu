@@ -102,7 +102,7 @@ def process_cad_file_sequentially(
         logger.info(f"Processing {script_path_obj.name} -> {file_specific_output_dir}")
 
         # --- 2.3 PyVista Setup (Headless Rendering) ---
-        pv.start_xvfb()
+        # pv.start_xvfb() # Moved to batch processor main function
         pv.OFF_SCREEN = True
         # pv.set_plot_theme("document") # Optional: consider if it affects output
 
