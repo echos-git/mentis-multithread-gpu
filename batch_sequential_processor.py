@@ -14,7 +14,13 @@ from tqdm import tqdm
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
 try:
-    from single_file_processor import process_cad_file_sequentially, DEFAULT_VIEWS
+    from single_file_processor import (
+        process_cad_file_sequentially, 
+        DEFAULT_VIEWS,
+        _CADQUERYTOSTL_AVAILABLE,
+        _GPU_POINTCLOUD_GENERATOR_AVAILABLE,
+        _GPU_BATCH_RENDERER_AVAILABLE
+    )
     SINGLE_FILE_PROCESSOR_AVAILABLE = True
 except ImportError as e:
     print(f"Critical Error: Could not import 'process_cad_file_sequentially' from 'single_file_processor.py'. Error: {e}")
@@ -297,7 +303,11 @@ def main():
             args.force_overwrite,
             args.render_width,
             args.render_height,
-            args.stage # Pass the processing_stage argument
+            args.stage, # Pass the processing_stage argument
+            # Pass the availability flags from the imported single_file_processor module
+            _CADQUERYTOSTL_AVAILABLE, 
+            _GPU_POINTCLOUD_GENERATOR_AVAILABLE,
+            _GPU_BATCH_RENDERER_AVAILABLE
         )
         tasks.append(task_args)
 

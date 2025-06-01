@@ -23,14 +23,18 @@ except ImportError:
     class PlaceholderGPUManager:
         def __enter__(self): return self
         def __exit__(self, exc_type, exc_val, exc_tb): pass
-        def get_plotter(self, **kwargs):
-            # Return a basic plotter if PyVista is available
-            if pv:
-                return pv.Plotter(off_screen=True, **kwargs)
-            raise RuntimeError("PyVista not available and GPUManager mock cannot create plotter.")
+        def get_renderer(self): # Matched to actual manager
+            if pv and _GPUBatchRenderer_class:
+                 # This placeholder might not be fully functional if _GPUBatchRenderer_class is the mock
+                return _GPUBatchRenderer_class(placeholder=True) 
+            raise RuntimeError("PyVista or GPUBatchRenderer not available for placeholder.")
+        def get_generator(self): # Matched to actual manager
+            if pv and _GPUPointCloudGenerator_class:
+                return _GPUPointCloudGenerator_class(placeholder=True)
+            raise RuntimeError("PyVista or GPUPointCloudGenerator not available for placeholder.")
 
     def get_gpu_manager(manager_type: str = "renderer"):
-        logging.warning(f"gpu_memory.py not found, using placeholder GPU manager for type '{manager_type}'. GPU functionalities will be limited or unavailable.")
+        logging.warning(f"gpu_memory.py not found, using placeholder GPU manager for type '{manager_type}'.")
         return PlaceholderGPUManager()
 
 # Global flag to track if pv.start_xvfb() has been called in the current process
@@ -42,6 +46,83 @@ DEFAULT_VIEWS: Tuple[str, ...] = (
     "back_right", "back_left" # "top", "bottom" are often less informative for CAD
 )
 
+# These are defined at module level but will be passed as args for robustness with multiprocessing
+# try:
+#     from cadquerytostl import cq_to_stl
+#     CADQUERYTOSTL_AVAILABLE = True 
+# except ImportError:
+#     CADQUERYTOSTL_AVAILABLE = False
+#     def cq_to_stl(*args, **kwargs): # Mock function
+#         logging.error("cadquerytostl.cq_to_stl is not available.")
+#         return None
+#
+# try:
+#     from gpu_pointclouds import GPUPointCloudGenerator
+#     GPU_POINTCLOUD_GENERATOR_AVAILABLE = True
+# except ImportError:
+#     GPU_POINTCLOUD_GENERATOR_AVAILABLE = False
+#     # ... mock class ...
+#
+# try:
+#     from gpu_render import GPUBatchRenderer
+#     GPU_BATCH_RENDERER_AVAILABLE = True
+# except ImportError:
+#     GPU_BATCH_RENDERER_AVAILABLE = False
+#     # ... mock class ...
+
+# --- Keep the mock definitions for when the imports fail at module level ---
+# These ensure the script can still be imported and potentially run with placeholders
+# if the dependencies are missing, though full functionality will be impaired.
+
+_CADQUERYTOSTL_AVAILABLE = False
+_cq_to_stl_func = None
+try:
+    from cadquerytostl import cq_to_stl as _cq_to_stl_func_imported
+    _cq_to_stl_func = _cq_to_stl_func_imported
+    _CADQUERYTOSTL_AVAILABLE = True
+except ImportError:
+    def _cq_to_stl_mock(*args, **kwargs):
+        logging.error("cadquerytostl.cq_to_stl is not available (mock used).")
+        return None
+    _cq_to_stl_func = _cq_to_stl_mock
+    _CADQUERYTOSTL_AVAILABLE = False
+
+_GPU_POINTCLOUD_GENERATOR_AVAILABLE = False
+_GPUPointCloudGenerator_class = None
+try:
+    from gpu_pointclouds import GPUPointCloudGenerator as _GPUPointCloudGenerator_class_imported
+    _GPUPointCloudGenerator_class = _GPUPointCloudGenerator_class_imported
+    _GPU_POINTCLOUD_GENERATOR_AVAILABLE = True
+except ImportError:
+    class _GPUPointCloudGeneratorMock:
+        def __init__(self, *args, **kwargs):
+            logging.error("gpu_pointclouds.GPUPointCloudGenerator is not available (mock used).")
+        def stl_to_pointcloud_gpu(self, *args, **kwargs):
+            logging.error("GPUPointCloudGenerator.stl_to_pointcloud_gpu is not available (mock used).")
+            return np.array([])
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc_val, exc_tb): pass
+    _GPUPointCloudGenerator_class = _GPUPointCloudGeneratorMock
+    _GPU_POINTCLOUD_GENERATOR_AVAILABLE = False
+
+_GPU_BATCH_RENDERER_AVAILABLE = False
+_GPUBatchRenderer_class = None
+try:
+    from gpu_render import GPUBatchRenderer as _GPUBatchRenderer_class_imported
+    _GPUBatchRenderer_class = _GPUBatchRenderer_class_imported
+    _GPU_BATCH_RENDERER_AVAILABLE = True
+except ImportError:
+    class _GPUBatchRendererMock:
+        def __init__(self, *args, **kwargs):
+            logging.error("gpu_render.GPUBatchRenderer is not available (mock used).")
+        def render_stl_multiview_gpu(self, *args, **kwargs):
+            logging.error("GPUBatchRenderer.render_stl_multiview_gpu is not available (mock used).")
+            return {}
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc_val, exc_tb): pass
+    _GPUBatchRenderer_class = _GPUBatchRendererMock
+    _GPU_BATCH_RENDERER_AVAILABLE = False
+
 def process_cad_file_sequentially(
     cad_script_path: str,
     base_output_dir: str,
@@ -50,7 +131,10 @@ def process_cad_file_sequentially(
     force_overwrite: bool = False,
     render_width: int = 1024,
     render_height: int = 1024,
-    processing_stage: Literal["all", "geometry", "render"] = "all"
+    processing_stage: Literal["all", "geometry", "render"] = "all",
+    cadquerytostl_available_flag: bool = True,
+    gpu_pointcloud_generator_available_flag: bool = True,
+    gpu_batch_renderer_available_flag: bool = True
 ) -> Dict[str, Any]:
     """
     Processes a single CadQuery .py file based on the specified processing_stage.
@@ -67,6 +151,9 @@ def process_cad_file_sequentially(
         render_width: Width of the rendered image.
         render_height: Height of the rendered image.
         processing_stage: "all", "geometry", or "render".
+        cadquerytostl_available_flag: Boolean indicating if cq_to_stl is available.
+        gpu_pointcloud_generator_available_flag: Boolean indicating if GPUPointCloudGenerator is available.
+        gpu_batch_renderer_available_flag: Boolean indicating if GPUBatchRenderer is available.
 
     Returns:
         A dictionary containing processing results and metadata:
@@ -143,8 +230,8 @@ def process_cad_file_sequentially(
             if stl_file_path.exists() and not force_overwrite:
                 logger.info(f"STL file already exists and force_overwrite is False: {stl_file_path}")
                 results["stages_processed"].append("stl_skipped_exists")
-            elif not CADQUERYTOSTL_AVAILABLE:
-                logger.error("cadquerytostl.cq_to_stl is not available. Skipping STL generation.")
+            elif not cadquerytostl_available_flag: # Use passed flag
+                logger.error("cadquerytostl.cq_to_stl is not available (flag). Skipping STL generation.")
                 results["status"] = "Error_STL_No_Generator"
                 results["error"] = "cq_to_stl not available"
                 results["processing_time_seconds"] = time.time() - function_start_time
@@ -153,7 +240,7 @@ def process_cad_file_sequentially(
                 try:
                     logger.info("Starting STL generation...")
                     stl_dir.mkdir(parents=True, exist_ok=True)
-                    generated_stl_path_str = cq_to_stl(
+                    generated_stl_path_str = _cq_to_stl_func( # Use the (potentially mock) function from module level
                         script_path=cad_script_path,
                         output_path=str(stl_file_path),
                         object_name=None, 
@@ -190,8 +277,8 @@ def process_cad_file_sequentially(
             elif pointcloud_file_path.exists() and not force_overwrite:
                 logger.info(f"Point cloud file already exists and force_overwrite is False: {pointcloud_file_path}")
                 results["stages_processed"].append("pointcloud_skipped_exists")
-            elif not GPU_POINTCLOUD_GENERATOR_AVAILABLE:
-                logger.warning("GPUPointCloudGenerator not available. Skipping point cloud generation.")
+            elif not gpu_pointcloud_generator_available_flag: # Use passed flag
+                logger.warning("GPUPointCloudGenerator not available (flag). Skipping point cloud generation.")
                 results["stages_processed"].append("pointcloud_skipped_no_generator")
                 if "Error" not in results["status"]: results["status"] = "Warning_No_PointCloud_Generator"
             elif Path(results["stl_file"]).exists(): # Added explicit check again, though theoretically covered by first if
@@ -199,16 +286,25 @@ def process_cad_file_sequentially(
                     logger.info("Starting point cloud generation...")
                     pointcloud_dir.mkdir(parents=True, exist_ok=True)
                     pc_generator_manager = get_gpu_manager("pointcloud")
-                    with pc_generator_manager.get_generator() as pc_generator:
-                        if pc_generator is None: 
-                            raise RuntimeError("Failed to acquire PointCloudGenerator from manager.")
-                        logger.info(f"Using PointCloudGenerator: {pc_generator}")
-                        
-                        point_cloud_np = pc_generator.stl_to_pointcloud_gpu(
-                            stl_file_path=results["stl_file"],
-                            num_points=num_points,
-                            device_id=0
-                        )
+                    with pc_generator_manager.get_generator() as pc_generator_instance:
+                        if pc_generator_instance is None: 
+                            # This path might be taken if get_gpu_manager returns a placeholder that yields None
+                            # or if the actual manager fails. The flag should ideally prevent this if generator truly unavailable.
+                            if gpu_pointcloud_generator_available_flag: # If flag said it was available, this is an unexpected runtime failure
+                                raise RuntimeError("Failed to acquire PointCloudGenerator from manager, though availability flag was true.")
+                            else: # Flag already indicated not available, this is consistent, log and skip.
+                                logger.warning("PointCloudGenerator acquisition failed, consistent with availability flag being false.")
+                                results["stages_processed"].append("pointcloud_skipped_no_generator_runtime")
+                                if "Error" not in results["status"]: results["status"] = "Warning_No_PointCloud_Generator"
+                                # Skip this specific try-block for point cloud generation
+                                pass 
+                        else:
+                            logger.info(f"Using PointCloudGenerator: {pc_generator_instance}")
+                            point_cloud_np = pc_generator_instance.stl_to_pointcloud_gpu(
+                                stl_file_path=results["stl_file"],
+                                num_points=num_points,
+                                device_id=0
+                            )
                     np.save(pointcloud_file_path, point_cloud_np)
                     logger.info(f"Point cloud generated and saved: {pointcloud_file_path}")
                     results["stages_processed"].append("pointcloud_generated")
@@ -252,8 +348,8 @@ def process_cad_file_sequentially(
                     results["stages_processed"].append("render_skipped_exists")
             
             if not all_renders_exist: # Proceed if not all exist or if force_overwrite
-                if not GPU_BATCH_RENDERER_AVAILABLE:
-                    logger.warning("GPUBatchRenderer not available. Skipping rendering.")
+                if not gpu_batch_renderer_available_flag: # Use passed flag
+                    logger.warning("GPUBatchRenderer not available (flag). Skipping rendering.")
                     results["stages_processed"].append("render_skipped_no_generator")
                     if "Error" not in results["status"] and "Warning" not in results["status"]:
                         results["status"] = "Warning_No_Render_Generator"
@@ -265,19 +361,27 @@ def process_cad_file_sequentially(
                         temp_render_output_base = output_sub_dir 
                         
                         renderer_manager = get_gpu_manager("renderer")
-                        with renderer_manager.get_renderer() as renderer:
-                            if renderer is None:
-                                raise RuntimeError("Failed to acquire GPUBatchRenderer from manager.")
-                            logger.info(f"Using GPUBatchRenderer: {renderer}")
-                            
-                            renderer.render_stl_multiview_gpu(
-                                stl_file_paths=[str(stl_file_for_render)],
-                                output_dir=str(temp_render_output_base),
-                                views=views,
-                                image_width=render_width,
-                                image_height=render_height,
-                                device_id=0
-                            )
+                        with renderer_manager.get_renderer() as renderer_instance:
+                            if renderer_instance is None:
+                                if gpu_batch_renderer_available_flag:
+                                    raise RuntimeError("Failed to acquire GPUBatchRenderer from manager, though availability flag was true.")
+                                else:
+                                    logger.warning("GPUBatchRenderer acquisition failed, consistent with availability flag being false.")
+                                    results["stages_processed"].append("render_skipped_no_generator_runtime")
+                                    if "Error" not in results["status"] and "Warning" not in results["status"]:
+                                        results["status"] = "Warning_No_Render_Generator"
+                                    # Skip this specific try-block for rendering
+                                    pass
+                            else:
+                                logger.info(f"Using GPUBatchRenderer: {renderer_instance}")
+                                renderer_instance.render_stl_multiview_gpu(
+                                    stl_file_paths=[str(stl_file_for_render)],
+                                    output_dir=str(temp_render_output_base),
+                                    views=views,
+                                    image_width=render_width,
+                                    image_height=render_height,
+                                    device_id=0
+                                )
 
                         source_render_subdir = temp_render_output_base / "renders" / filename_no_ext
                         if source_render_subdir.exists() and source_render_subdir.is_dir():
