@@ -299,8 +299,8 @@ def process_cad_file_sequentially(
                             
                             logger.info(f"Using PointCloudGenerator instance: {pc_generator_instance}")
                             point_cloud_np = pc_generator_instance.stl_to_pointcloud_gpu(
-                                stl_file_path=results["stl_file"],
-                                num_points=num_points # device_id is likely handled by its constructor or defaults
+                                results["stl_file"], # Pass stl_path as a positional argument
+                                n_points=num_points  # Pass num_points as keyword argument n_points
                             )
                             np.save(pointcloud_file_path, point_cloud_np)
                             logger.info(f"Point cloud generated and saved: {pointcloud_file_path}")
