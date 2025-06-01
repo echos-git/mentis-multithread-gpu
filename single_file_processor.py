@@ -4,8 +4,9 @@ import traceback
 import numpy as np
 import pyvista as pv
 from pathlib import Path
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Literal
 import json # For json.dumps in the main block
+import shutil
 # Global lock for PyVista rendering operations to prevent concurrent access issues
 # GLX context errors often arise from multiple threads using graphics resources simultaneously.
 # _pyvista_render_lock = threading.Lock() # REMOVED for multiprocessing
@@ -28,53 +29,59 @@ except ImportError:
                 return pv.Plotter(off_screen=True, **kwargs)
             raise RuntimeError("PyVista not available and GPUManager mock cannot create plotter.")
 
-    def get_gpu_manager():
-        logging.warning("gpu_memory.py not found, using placeholder GPU manager. GPU functionalities will be limited or unavailable.")
+    def get_gpu_manager(manager_type: str = "renderer"):
+        logging.warning(f"gpu_memory.py not found, using placeholder GPU manager for type '{manager_type}'. GPU functionalities will be limited or unavailable.")
         return PlaceholderGPUManager()
+
+# Global flag to track if pv.start_xvfb() has been called in the current process
+_xvfb_started_in_process = False
+
+DEFAULT_VIEWS: Tuple[str, ...] = (
+    "iso", "front", "back", "right", "left", "top", "bottom",
+    "above_ne", "above_nw", "above_se", "above_sw",
+    "back_right", "back_left" # "top", "bottom" are often less informative for CAD
+)
 
 def process_cad_file_sequentially(
     cad_script_path: str,
     base_output_dir: str,
-    num_points: int = 10000,
-    image_size: Tuple[int, int] = (1024, 1024),
+    views: Tuple[str, ...] = DEFAULT_VIEWS,
+    num_points: int = 4096,
     force_overwrite: bool = False,
-    use_global_lighting: bool = False
+    render_width: int = 1024,
+    render_height: int = 1024,
+    processing_stage: Literal["all", "geometry", "render"] = "all"
 ) -> Dict[str, Any]:
     """
-    Processes a single CadQuery .py file to generate an STL, a point cloud,
-    and 14 rendered views, sequentially.
+    Processes a single CadQuery .py file based on the specified processing_stage.
+    - "geometry": Converts to STL and generates a point cloud.
+    - "render": Renders multiple views from an existing STL.
+    - "all": Performs both geometry and render stages.
 
     Args:
-        cad_script_path: Absolute or relative path to the CadQuery Python script.
-        base_output_dir: The base directory where all outputs for this file 
-                         (and others) will be stored. A subdirectory named after 
-                         the CAD file stem will be created here.
-        num_points: Number of points to generate for the point cloud.
-        image_size: Tuple (width, height) for rendered images.
-        force_overwrite: If True, overwrite existing output files.
-        use_global_lighting: If True, use a global lighting setup for rendering,
-                             otherwise use view-specific lights.
+        cad_script_path: Absolute path to the CadQuery .py script.
+        base_output_dir: The root directory where outputs will be stored.
+        views: A tuple of view names for rendering.
+        num_points: Number of points for the point cloud.
+        force_overwrite: If True, overwrite existing files for the current stage(s).
+        render_width: Width of the rendered image.
+        render_height: Height of the rendered image.
+        processing_stage: "all", "geometry", or "render".
 
     Returns:
-        A dictionary containing processing results:
-        - On success:
-            {
-                'success': True,
-                'file': str (input file path),
-                'stl_path': str (generated STL file path),
-                'pointcloud_path': str (generated .npy file path),
-                'render_results': Dict[str, str] (view names → PNG paths),
-                'processing_time': float (seconds elapsed),
-                'num_renders': int (number of successfully rendered views),
-                'output_dir': str (base output directory for this specific file)
-            }
-        - On failure:
-            {
-                'success': False,
-                'file': str (input file path),
-                'error': str (error message),
-                'traceback': str (full Python traceback)
-            }
+        A dictionary containing processing results and metadata:
+        {
+            "cad_file": str (path to the input CAD script),
+            "output_subdir": str (path to the dedicated output subdirectory for this file),
+            "stl_file": str (path to the STL file, expected or generated),
+            "pointcloud_file": str (path to the point cloud .npy file, expected or generated),
+            "render_files": Dict[str, str] (view_name -> path to render .png file),
+            "status": str (Overall status, e.g., "Completed_All_Stages", "Error_STL", "Warning_No_Render_Generator", "Completed_Skipped_All_Exist_Or_Unavailable"),
+            "stages_processed": List[str] (chronological list of operations performed or skipped, e.g., ["stl_generated", "pointcloud_skipped_exists"]),
+            "error": Optional[str] (error message if an error status is set),
+            "traceback": Optional[str] (Python traceback if an error status is set),
+            "processing_time_seconds": float (total time taken for processing this file)
+        }
     """
     logger = logging.getLogger(f"{__name__}.{Path(cad_script_path).stem}")
     function_start_time = time.time()
@@ -90,14 +97,14 @@ def process_cad_file_sequentially(
         if not script_path_obj.is_file():
             raise FileNotFoundError(f"Input CadQuery script not found: {cad_script_path}")
 
-        file_stem = script_path_obj.stem
+        filename_no_ext = script_path_obj.stem
         # filename_no_ext is already defined from cad_script_path
         
         # Ensure output directories exist
         # Modified to include the parent directory name of the input file (e.g., 'batch_00')
         # in the output path to avoid collisions when processing multiple input batches.
         input_batch_dir_name = script_path_obj.parent.name 
-        output_sub_dir = base_output_dir_obj / input_batch_dir_name / file_stem
+        output_sub_dir = base_output_dir_obj / input_batch_dir_name / filename_no_ext
         
         stl_dir = output_sub_dir / "stls"
         pointcloud_dir = output_sub_dir / "pointclouds"
@@ -108,347 +115,391 @@ def process_cad_file_sequentially(
         pointcloud_dir.mkdir(parents=True, exist_ok=True)
         render_dir.mkdir(parents=True, exist_ok=True)
 
-        stl_output_path = stl_dir / f"{file_stem}.stl"
-        pointcloud_output_path = pointcloud_dir / f"{file_stem}.npy"
+        stl_output_path = stl_dir / f"{filename_no_ext}.stl"
+        pointcloud_output_path = pointcloud_dir / f"{filename_no_ext}.npy"
 
-        logger.info(f"Processing {script_path_obj.name} -> {output_sub_dir}")
+        logger.info(f"Processing {script_path_obj.name} -> {output_sub_dir} (Stage: {processing_stage})")
 
-        # --- 2.3 PyVista Setup (Headless Rendering) ---
-        # pv.start_xvfb() # REMOVED - OSMesa handles headless, or Xvfb was handled per-process before
-        # pv.OFF_SCREEN = True # Ensured at the top of the function
-        # pv.set_plot_theme("document") # Optional: consider if it affects output
+        # --- STAGE: GEOMETRY (STL and Point Cloud) ---
+        if processing_stage in ["all", "geometry"]:
+            results["status"] = "Processing_Geometry"
+            # --- 2.4 STL Generation ---
+            stl_file_path = Path(results["stl_file"])
 
-        # --- 2.4 GPU Resource Manager ---
-        # This will initialize the manager if it's the first call,
-        # or return the existing instance.
-        # The actual GPU resources are typically used within context managers
-        # by the specialized classes (PointCloudGenerator, BatchRenderer).
-        if GPU_MEMORY_AVAILABLE:
-            gpu_manager = get_gpu_manager()
-            logger.info("GPU Manager obtained.")
-        else:
-            logger.warning("Using placeholder GPU manager due to missing gpu_memory module.")
-            gpu_manager = get_gpu_manager()
-
-        logger.info("Phase 1 (Setup) complete. STL generation next.")
-        
-        actual_stl_path = None # Will store the path if STL is successfully generated/found
-
-        # --- 3. Integrate STL Generation ---
-        try:
-            # Attempt to import cq_to_stl from cadquerytostl
-            from cadquerytostl import cq_to_stl
-            STL_GENERATION_POSSIBLE = True
-        except ImportError:
-            STL_GENERATION_POSSIBLE = False
-            logger.error("cadquerytostl.py not found or cq_to_stl function cannot be imported. STL generation will be skipped.")
-            # This is a critical failure for the pipeline if STL is needed for subsequent steps.
-            # Consider how to handle this: either raise an error or allow pipeline to continue if STL is optional.
-            # For now, let's assume it's critical and leads to failure of this function if STL cannot be made.
-            raise RuntimeError("STL generation prerequisite (cadquerytostl.py) not available.")
-
-        if not stl_output_path.exists() or force_overwrite:
-            logger.info(f"Generating STL file: {stl_output_path}")
-            if not STL_GENERATION_POSSIBLE:
-                 # This check is somewhat redundant given the raise above, but good for clarity
-                raise RuntimeError("Cannot generate STL: cadquerytostl module not available.")
-            try:
-                cq_to_stl(str(script_path_obj), str(stl_output_path))
-                if not stl_output_path.exists():
-                    raise FileNotFoundError(f"STL file was not created by cq_to_stl: {stl_output_path}")
-                logger.info(f"STL file generated successfully: {stl_output_path}")
-                actual_stl_path = stl_output_path
-            except Exception as stl_e:
-                logger.error(f"STL generation failed for {script_path_obj.name}: {stl_e}")
-                # Propagate the error to the main try-except block
-                raise RuntimeError(f"STL generation failed: {stl_e}") from stl_e
-        else:
-            logger.info(f"STL file already exists and force_overwrite is False: {stl_output_path}")
-            actual_stl_path = stl_output_path
-        
-        actual_pointcloud_path = None # Will store path if successful
-
-        # --- 4. Integrate Point Cloud Generation ---
-        if actual_stl_path: # Only proceed if STL was successfully obtained
-            try:
-                from gpu_pointclouds import GPUPointCloudGenerator
-                POINTCLOUD_GENERATION_POSSIBLE = True
-            except ImportError:
-                POINTCLOUD_GENERATION_POSSIBLE = False
-                logger.error("gpu_pointclouds.py not found or GPUPointCloudGenerator cannot be imported. Point cloud generation will be skipped.")
-                # Depending on requirements, this could be a critical failure.
-                # For now, let's assume it is, to ensure the full pipeline integrity.
-                raise RuntimeError("Point cloud generation prerequisite (gpu_pointclouds.py) not available.")
-
-            if not pointcloud_output_path.exists() or force_overwrite:
-                logger.info(f"Generating point cloud: {pointcloud_output_path} from {actual_stl_path}")
-                if not POINTCLOUD_GENERATION_POSSIBLE:
-                    raise RuntimeError("Cannot generate point cloud: gpu_pointclouds module not available.")
-                try:
-                    # Assuming device_id 0 for single-threaded focused processing for now.
-                    # gpu_manager is available if GPU_MEMORY_AVAILABLE is True.
-                    # GPUPointCloudGenerator might use get_gpu_manager() internally if needed for context.
-                    pc_generator = GPUPointCloudGenerator(device_id=0) 
-                    points_array = pc_generator.stl_to_pointcloud_gpu(str(actual_stl_path), num_points)
-                    
-                    np.save(str(pointcloud_output_path), points_array)
-                    if not pointcloud_output_path.exists():
-                        raise FileNotFoundError(f"Point cloud file (.npy) was not created: {pointcloud_output_path}")
-                    logger.info(f"Point cloud generated successfully: {pointcloud_output_path}")
-                    actual_pointcloud_path = pointcloud_output_path
-                except Exception as pc_e:
-                    logger.error(f"Point cloud generation failed for {actual_stl_path.name}: {pc_e}")
-                    raise RuntimeError(f"Point cloud generation failed: {pc_e}") from pc_e
+            if stl_file_path.exists() and not force_overwrite:
+                logger.info(f"STL file already exists and force_overwrite is False: {stl_file_path}")
+                results["stages_processed"].append("stl_skipped_exists")
+            elif not CADQUERYTOSTL_AVAILABLE:
+                logger.error("cadquerytostl.cq_to_stl is not available. Skipping STL generation.")
+                results["status"] = "Error_STL_No_Generator"
+                results["error"] = "cq_to_stl not available"
+                results["processing_time_seconds"] = time.time() - function_start_time
+                return results
             else:
-                logger.info(f"Point cloud file already exists and force_overwrite is False: {pointcloud_output_path}")
-                actual_pointcloud_path = pointcloud_output_path
-        else:
-            logger.warning("Skipping point cloud generation as STL file was not available.")
-            # This implies a failure in STL step, which should have already raised an error and exited.
-            # However, if STL was optional, this path would be taken. For now, an error in STL gen is fatal.
-
-        actual_render_results = {} # Stores {view_name: path_to_png}
-        actual_num_renders = 0
-
-        # --- 5. Integrate Multi-View Rendering ---
-        if actual_stl_path: # Only proceed if STL was successfully obtained
-            try:
-                from gpu_render import GPUBatchRenderer
-                RENDERING_POSSIBLE = True
-            except ImportError:
-                RENDERING_POSSIBLE = False
-                logger.error("gpu_render.py not found or GPUBatchRenderer cannot be imported. Rendering will be skipped.")
-                raise RuntimeError("Rendering prerequisite (gpu_render.py) not available.")
-
-            expected_views = [
-                'front', 'back', 'right', 'left', 'top', 'bottom', 
-                'above_ne', 'above_nw', 'above_se', 'above_sw',
-                'below_ne', 'below_nw', 'below_se', 'below_sw'
-            ]
-
-            # render_dir is the TARGET directory for final images (e.g., .../my_model/renders/)
-            # renderer_source_output_dir is where GPUBatchRenderer will place files initially
-            # (e.g., .../my_model/renders/my_model/)
-            renderer_source_output_dir = render_dir / file_stem 
-
-            # Check if all renders already exist in the FINAL TARGET directory
-            all_renders_exist_in_target = True
-            if not force_overwrite:
-                for view_name in expected_views:
-                    expected_target_path = render_dir / f"{view_name}.png"
-                    if not expected_target_path.exists():
-                        all_renders_exist_in_target = False
-                        break
-            
-            if all_renders_exist_in_target and not force_overwrite:
-                logger.info(f"All {len(expected_views)} render files already exist in target {render_dir} and force_overwrite is False.")
-                for view_name in expected_views:
-                    actual_render_results[view_name] = str((render_dir / f"{view_name}.png").resolve())
-                actual_num_renders = len(expected_views)
-            else:
-                logger.info(f"Proceeding with rendering for {actual_stl_path.name}. Target: {render_dir}")
-                if not RENDERING_POSSIBLE:
-                    raise RuntimeError("Cannot render: gpu_render module not available.")
-                
-                # Ensure the source directory for the renderer is clean if force_overwrite is true
-                if force_overwrite and renderer_source_output_dir.exists():
-                    for item in renderer_source_output_dir.iterdir():
-                        if item.is_file():
-                            item.unlink()
-                        elif item.is_dir(): # Should not happen with current renderer, but for safety
-                            import shutil
-                            shutil.rmtree(item)
-                renderer_source_output_dir.mkdir(parents=True, exist_ok=True) # Ensure it exists for renderer
-
                 try:
-                    # Acquire lock before rendering operations
-                    # logger.debug(f"Thread {threading.get_ident()} acquiring render lock for {actual_stl_path.name}")
-                    # with _pyvista_render_lock: # REMOVED for multiprocessing
-                    #    logger.debug(f"Thread {threading.get_ident()} acquired render lock for {actual_stl_path.name}")
-                    renderer = GPUBatchRenderer(device_id=0, image_size=image_size)
-                    
-                    render_results_from_call = renderer.render_stl_multiview_gpu(
-                        stl_path=str(actual_stl_path),
-                        output_base_dir=str(render_dir), 
-                        use_global_lighting=use_global_lighting,
-                        force_overwrite=force_overwrite 
+                    logger.info("Starting STL generation...")
+                    stl_dir.mkdir(parents=True, exist_ok=True)
+                    generated_stl_path_str = cq_to_stl(
+                        script_path=cad_script_path,
+                        output_path=str(stl_file_path),
+                        object_name=None, 
+                        tolerance=0.1, 
+                        angular_tolerance=0.1,
+                        logger_name=logger.name
                     )
-                    # logger.debug(f"Thread {threading.get_ident()} releasing render lock for {actual_stl_path.name}")
-                    # Lock is released automatically by exiting the 'with' block
+                    if generated_stl_path_str and Path(generated_stl_path_str).exists():
+                        results["stl_file"] = generated_stl_path_str
+                        logger.info(f"STL file generated successfully: {generated_stl_path_str}")
+                        results["stages_processed"].append("stl_generated")
+                    else:
+                        raise RuntimeError(f"cq_to_stl did not return a valid path or file was not created: {generated_stl_path_str}")
+                except Exception as e:
+                    logger.error(f"Error during STL generation for {filename_no_ext}: {e}")
+                    logger.debug(traceback.format_exc())
+                    results["status"] = "Error_STL"
+                    results["error"] = str(e)
+                    results["traceback"] = traceback.format_exc()
+                    results["processing_time_seconds"] = time.time() - function_start_time
+                    return results
 
-                    if not render_results_from_call:
-                        if not all_renders_exist_in_target:
-                            raise RuntimeError("Rendering call returned no results, but files were expected.")
-                        else: # This means files pre-existed in target, and renderer also found them pre-existing in its source (less likely scenario) or simply did nothing.
-                             logger.info("Renderer returned no results, assuming pre-existing files handled.")
-                             # Repopulate from target as a fallback if this path is hit unexpectedly.
-                             for view_name in expected_views:
-                                actual_render_results[view_name] = str((render_dir / f"{view_name}.png").resolve())
-                             actual_num_renders = len(expected_views)
+            # --- 2.5 Point Cloud Generation (within "all" or "geometry" stage) ---
+            pointcloud_file_path = Path(results["pointcloud_file"])
+            if not Path(results["stl_file"]).exists():
+                logger.error(f"Cannot generate point cloud, STL file is missing: {results['stl_file']}")
+                results["status"] = "Error_PointCloud_No_STL"
+                if not results["error"]: results["error"] = "STL file missing for point cloud generation."
+                results["stages_processed"].append("pointcloud_skipped_no_stl")
+                if processing_stage == "geometry": # If only doing geometry, this is a terminal error for the stage
+                    results["processing_time_seconds"] = time.time() - function_start_time
+                    return results 
 
-                    temp_moved_results = {}
-                    successful_renders_count = 0
-                    if render_results_from_call: # If renderer provided a list of what it did
-                        for view_name, G_PathStr_source in render_results_from_call.items():
-                            source_file_path = Path(G_PathStr_source)
-                            if "FAILED_RENDERING" not in G_PathStr_source and source_file_path.exists():
-                                target_file_name = source_file_path.name 
-                                target_file_path = render_dir / target_file_name
-
-                                target_file_path.parent.mkdir(parents=True, exist_ok=True)
-                                if target_file_path.exists() and force_overwrite and target_file_path != source_file_path:
-                                    target_file_path.unlink()
-                                
-                                if source_file_path != target_file_path:
-                                    source_file_path.rename(target_file_path)
-                                
-                                temp_moved_results[view_name] = str(target_file_path.resolve())
-                                successful_renders_count += 1
-                            else:
-                                logger.warning(f"View '{view_name}' failed by renderer or source file not found: {G_PathStr_source}")
+            elif pointcloud_file_path.exists() and not force_overwrite:
+                logger.info(f"Point cloud file already exists and force_overwrite is False: {pointcloud_file_path}")
+                results["stages_processed"].append("pointcloud_skipped_exists")
+            elif not GPU_POINTCLOUD_GENERATOR_AVAILABLE:
+                logger.warning("GPUPointCloudGenerator not available. Skipping point cloud generation.")
+                results["stages_processed"].append("pointcloud_skipped_no_generator")
+                if "Error" not in results["status"]: results["status"] = "Warning_No_PointCloud_Generator"
+            elif Path(results["stl_file"]).exists(): # Added explicit check again, though theoretically covered by first if
+                try:
+                    logger.info("Starting point cloud generation...")
+                    pointcloud_dir.mkdir(parents=True, exist_ok=True)
+                    pc_generator_manager = get_gpu_manager("pointcloud")
+                    with pc_generator_manager.get_generator() as pc_generator:
+                        if pc_generator is None: 
+                            raise RuntimeError("Failed to acquire PointCloudGenerator from manager.")
+                        logger.info(f"Using PointCloudGenerator: {pc_generator}")
                         
-                        actual_render_results = temp_moved_results
-                        actual_num_renders = successful_renders_count
-
-                    if actual_num_renders < len(expected_views) and (not all_renders_exist_in_target or force_overwrite):
-                        logger.warning(f"Expected {len(expected_views)} renders, but only {actual_num_renders} were successful post-processing.")
-                        if actual_num_renders == 0:
-                            raise RuntimeError("Rendering and post-processing produced no valid image files.")
-                    
-                    logger.info(f"Rendering and file placement completed. {actual_num_renders} views in {render_dir}")
-
-                    # Clean up the renderer's specific source output subdirectory if it's empty and different
-                    if renderer_source_output_dir.exists() and renderer_source_output_dir != render_dir:
-                        try:
-                            if not any(renderer_source_output_dir.iterdir()): # Check if empty
-                                renderer_source_output_dir.rmdir()
-                                logger.info(f"Cleaned up empty renderer source output subdirectory: {renderer_source_output_dir}")
-                        except OSError as e:
-                            logger.warning(f"Could not remove renderer source output subdirectory {renderer_source_output_dir}: {e}")
-                
-                except Exception as render_e:
-                    logger.error(f"Rendering process failed for {actual_stl_path.name}: {render_e}")
-                    raise RuntimeError(f"Rendering process failed: {render_e}") from render_e
-        else:
-            logger.warning("Skipping rendering as STL file was not available.")
-
-        # --- Result Compilation ---
-        processing_time = time.time() - function_start_time
+                        point_cloud_np = pc_generator.stl_to_pointcloud_gpu(
+                            stl_file_path=results["stl_file"],
+                            num_points=num_points,
+                            device_id=0
+                        )
+                    np.save(pointcloud_file_path, point_cloud_np)
+                    logger.info(f"Point cloud generated and saved: {pointcloud_file_path}")
+                    results["stages_processed"].append("pointcloud_generated")
+                except Exception as e:
+                    logger.error(f"Error during point cloud generation for {filename_no_ext}: {e}")
+                    logger.debug(traceback.format_exc())
+                    results["status"] = "Error_PointCloud"
+                    results["error"] = str(e)
+                    results["traceback"] = traceback.format_exc()
+                    if processing_stage == "geometry": # If only doing geometry, this is a terminal error for the stage
+                        results["processing_time_seconds"] = time.time() - function_start_time
+                        return results
         
-        # Determine overall success based on critical components
-        # For this example, STL and at least one Point Cloud and one Render are critical if attempted
-        final_success_status = False
-        if actual_stl_path and actual_pointcloud_path and actual_num_renders > 0:
-            final_success_status = True
-        elif actual_stl_path and actual_pointcloud_path and not RENDERING_POSSIBLE: # If rendering wasn't possible but others were
-            final_success_status = True # Or False, depending on strictness
-        elif actual_stl_path and not POINTCLOUD_GENERATION_POSSIBLE and not RENDERING_POSSIBLE:
-             final_success_status = True # If only STL was possible and made
-        # More nuanced success conditions can be added here.
-        # For a simple start, let's say success means all attempted steps that *were possible* completed.
-        
-        # A more robust check: if a step was supposed to run (its module was available) and it didn't produce output, it's a failure.
-        pipeline_steps_completed = True
-        if not actual_stl_path: pipeline_steps_completed = False # STL is always critical
-        
-        # Check Pointcloud success if its generation was possible
-        try: from gpu_pointclouds import GPUPointCloudGenerator 
-        except ImportError: POINTCLOUD_GENERATION_POSSIBLE = False
-        else: POINTCLOUD_GENERATION_POSSIBLE = True
-        if POINTCLOUD_GENERATION_POSSIBLE and not actual_pointcloud_path: pipeline_steps_completed = False
+        # --- STAGE: RENDER ---
+        if processing_stage in ["all", "render"]:
+            # Update status, but preserve earlier errors from geometry stage if processing_stage is 'all'
+            if results["status"] not in ["Error_STL", "Error_PointCloud", "Error_STL_No_Generator", "Error_PointCloud_No_STL"]:
+                results["status"] = "Processing_Render"
+            
+            stl_file_for_render = Path(results["stl_file"])
+            if not stl_file_for_render.exists():
+                logger.error(f"Rendering stage: STL file not found at {stl_file_for_render}. Cannot render.")
+                results["status"] = "Error_Render_No_STL"
+                if not results["error"]: results["error"] = f"STL file not found for rendering: {stl_file_for_render}"
+                results["processing_time_seconds"] = time.time() - function_start_time
+                return results # Critical error for render stage if STL is missing
 
-        # Check Rendering success if its generation was possible
-        try: from gpu_render import GPUBatchRenderer
-        except ImportError: RENDERING_POSSIBLE = False
-        else: RENDERING_POSSIBLE = True
-        if RENDERING_POSSIBLE and actual_num_renders < len(expected_views):
-             pipeline_steps_completed = False # Or actual_num_renders == 0 for a more lenient check
+            # Overwrite check for rendering
+            all_renders_exist = False
+            if not force_overwrite:
+                all_renders_exist = True # Assume true, then check
+                render_dir.mkdir(parents=True, exist_ok=True) # Ensure dir exists for check (using render_dir)
+                for view_name in views:
+                    if not (render_dir / f"{view_name}.png").exists(): # using render_dir
+                        all_renders_exist = False
+                        break
+                if all_renders_exist:
+                    logger.info(f"All render files exist in {render_dir} and force_overwrite is False. Skipping rendering.") # using render_dir
+                    for view_name in views:
+                        results["render_files"][view_name] = str(render_dir / f"{view_name}.png") # using render_dir
+                    results["stages_processed"].append("render_skipped_exists")
+            
+            if not all_renders_exist: # Proceed if not all exist or if force_overwrite
+                if not GPU_BATCH_RENDERER_AVAILABLE:
+                    logger.warning("GPUBatchRenderer not available. Skipping rendering.")
+                    results["stages_processed"].append("render_skipped_no_generator")
+                    if "Error" not in results["status"] and "Warning" not in results["status"]:
+                        results["status"] = "Warning_No_Render_Generator"
+                else:
+                    try:
+                        logger.info(f"Starting multi-view rendering for {stl_file_for_render.name}...")
+                        render_dir.mkdir(parents=True, exist_ok=True) # using render_dir
+                        
+                        temp_render_output_base = output_sub_dir 
+                        
+                        renderer_manager = get_gpu_manager("renderer")
+                        with renderer_manager.get_renderer() as renderer:
+                            if renderer is None:
+                                raise RuntimeError("Failed to acquire GPUBatchRenderer from manager.")
+                            logger.info(f"Using GPUBatchRenderer: {renderer}")
+                            
+                            renderer.render_stl_multiview_gpu(
+                                stl_file_paths=[str(stl_file_for_render)],
+                                output_dir=str(temp_render_output_base),
+                                views=views,
+                                image_width=render_width,
+                                image_height=render_height,
+                                device_id=0
+                            )
 
-        final_success_status = pipeline_steps_completed
+                        source_render_subdir = temp_render_output_base / "renders" / filename_no_ext
+                        if source_render_subdir.exists() and source_render_subdir.is_dir():
+                            logger.info(f"Moving renders from {source_render_subdir} to {render_dir}") # using render_dir
+                            for view_file in source_render_subdir.glob("*.png"):
+                                target_file_path = render_dir / view_file.name # using render_dir
+                                shutil.move(str(view_file), str(target_file_path))
+                                results["render_files"][view_file.stem] = str(target_file_path)
+                                logger.debug(f"Moved {view_file} to {target_file_path}")
+                            
+                            try:
+                                source_render_subdir.rmdir()
+                                if not any((temp_render_output_base / "renders").iterdir()):
+                                    (temp_render_output_base / "renders").rmdir()
+                            except OSError as e:
+                                logger.warning(f"Could not clean up temporary render directory {source_render_subdir} or its parent: {e}")
+                        else:
+                            logger.warning(f"Expected source render directory {source_render_subdir} not found after rendering.")
+                            if "Error" not in results["status"] and "Warning" not in results["status"]:
+                                results["status"] = "Warning_Render_Output_Missing"
+                        
+                        logger.info(f"Rendering completed for {filename_no_ext}.")
+                        results["stages_processed"].append("render_generated")
 
-        return {
-            'success': final_success_status,
-            'file': str(script_path_obj.resolve()),
-            'stl_path': str(actual_stl_path.resolve()) if actual_stl_path else None,
-            'pointcloud_path': str(actual_pointcloud_path.resolve()) if actual_pointcloud_path else None,
-            'render_results': actual_render_results, 
-            'processing_time': processing_time,
-            'num_renders': actual_num_renders,
-            'output_dir': str(output_sub_dir.resolve())
-        }
+                    except Exception as e:
+                        logger.error(f"Error during rendering for {filename_no_ext}: {e}")
+                        logger.debug(traceback.format_exc())
+                        results["status"] = "Error_Render"
+                        results["error"] = str(e)
+                        results["traceback"] = traceback.format_exc()
 
-    except Exception as e:
-        logger.error(f"Processing failed for {cad_script_path}: {e}")
-        return {
-            'success': False,
-            'file': str(cad_script_path), # Use original path string
-            'error': str(e),
-            'traceback': traceback.format_exc()
-        }
+        # --- Final Status Determination ---
+        if "Error" in results["status"]:
+            pass # Error status is already set and is specific
+        elif results["status"] == "Scheduled": # No stages were actually run (e.g. bad processing_stage input - unlikely with Literal)
+            results["status"] = "No_Action_Taken"
+        elif processing_stage == "all":
+            if all(item in results["stages_processed"] for item in ["stl_generated", "pointcloud_generated", "render_generated"]) or \
+               all(item in results["stages_processed"] for item in ["stl_skipped_exists", "pointcloud_skipped_exists", "render_skipped_exists"]):
+                results["status"] = "Completed_All_Stages"
+            elif "Warning" in results["status"]:
+                pass # Preserve warning status (e.g. Warning_No_Render_Generator)
+            else: # Partial success or unexpected state for 'all'
+                results["status"] = f"Completed_All_Stages_Partial: {results['stages_processed']}"
+        elif processing_stage == "geometry":
+            if all(item in results["stages_processed"] for item in ["stl_generated", "pointcloud_generated"]) or \
+               all(item in results["stages_processed"] for item in ["stl_skipped_exists", "pointcloud_skipped_exists"]):
+                results["status"] = "Completed_Geometry_Stage"
+            elif "Warning" in results["status"]:
+                pass
+            else:
+                results["status"] = f"Completed_Geometry_Stage_Partial: {results['stages_processed']}"
+        elif processing_stage == "render":
+            if "render_generated" in results["stages_processed"] or "render_skipped_exists" in results["stages_processed"]:
+                results["status"] = "Completed_Render_Stage"
+            elif "Warning" in results["status"]:
+                pass
+            else:
+                results["status"] = f"Completed_Render_Stage_Partial: {results['stages_processed']}"
+
+    except Exception as e: # Main try-except block's catch for unhandled exceptions
+        logger.error(f"Unhandled exception processing {filename_no_ext} (Stage: {processing_stage}): {e}")
+        logger.debug(traceback.format_exc())
+        results["status"] = "Error_Unhandled"
+        results["error"] = str(e)
+        results["traceback"] = traceback.format_exc()
+        # Ensure essential keys exist even if error happened before results was fully populated
+        results.setdefault("cad_file", cad_script_path)
+        results.setdefault("output_subdir", str(output_sub_dir) if 'output_sub_dir' in locals() else base_output_dir)
+        results.setdefault("stages_processed", [])
+        results.setdefault("render_files", {})
+
+    results["processing_time_seconds"] = time.time() - function_start_time
+    
+    # Adjust final log status message for clarity if no actual processing occurred due to skips
+    final_log_display_status = results["status"]
+    if not results["error"] and not any(s.endswith("_generated") for s in results["stages_processed"]):
+        if all(s.endswith(("_skipped_exists", "_skipped_no_generator", "_skipped_no_stl")) for s in results["stages_processed"]):
+            final_log_display_status = "Completed_Skipped_All_Exist_Or_Unavailable"
+        elif not results["stages_processed"] and results["status"] == "Scheduled": # Should be caught by No_Action_Taken
+             final_log_display_status = "No_Action_Taken"
+
+    logger.info(
+        f"Finished processing {filename_no_ext} in {results['processing_time_seconds']:.2f}s. "
+        f"Stage: {processing_stage}, Final Status: {final_log_display_status}, Stages Detail: {results['stages_processed']}"
+    )
+    return results
 
 if __name__ == "__main__":
-    # Basic logging setup for standalone execution
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-    logger = logging.getLogger(__name__)
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    test_logger = logging.getLogger(__name__)
 
-    # Create dummy files and directories for testing
-    # In a real scenario, these paths would point to actual data.
-    dummy_cad_dir = Path("_test_cad_files")
-    dummy_cad_dir.mkdir(exist_ok=True)
-    dummy_cad_file = dummy_cad_dir / "test_model.py"
-    
-    # Create a minimal CadQuery script for testing
-    # This script should be runnable by cadquerytostl.py
-    dummy_cad_content = """
+    dummy_cad_script_content = """
 import cadquery as cq
-# Create a simple box
-result = cq.Workplane("XY").box(1, 2, 3) 
-# If your cadquerytostl.py expects specific variable names like 'part' or 'model', adjust here.
-# For example, if it looks for 'part':
-# part = cq.Workplane("XY").box(1, 2, 3)
+result = cq.Workplane("XY").box(1, 2, 3)
+# show_object(result) # Not needed for stl export, but useful for direct CadQuery debugging
 """
-    with open(dummy_cad_file, "w") as f:
-        f.write(dummy_cad_content)
+    test_dir = Path("_test_single_file_processor_workspace") # More specific name
+    test_output_dir = test_dir / "outputs"
+    dummy_script_path = test_dir / "dummy_box.py"
 
-    test_output_dir = Path("_test_output_dir")
-    test_output_dir.mkdir(exist_ok=True)
+    # Define input_batch_dir_name for cleanup path construction, mirroring logic in process_cad_file_sequentially
+    input_batch_dir_name = dummy_script_path.parent.name
 
-    logger.info(f"Running test processing for: {dummy_cad_file}")
-    
-    result = process_cad_file_sequentially(
-        cad_script_path=str(dummy_cad_file),
-        base_output_dir=str(test_output_dir),
-        num_points=500, # Smaller for faster test
-        force_overwrite=True
+    # Ensure clean state for testing
+    if test_dir.exists():
+        shutil.rmtree(test_dir)
+    test_dir.mkdir(parents=True, exist_ok=True)
+    test_output_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(dummy_script_path, "w") as f:
+        f.write(dummy_cad_script_content)
+    test_logger.info(f"Created dummy script: {dummy_script_path}")
+
+    def check_results(results_dict, expected_status_part, stage_name, expect_error=False):
+        log_dump = json.dumps(results_dict, indent=2)
+        test_logger.info(f"Results ({stage_name}):\n{log_dump}")
+        if expect_error:
+            assert "Error" in results_dict["status"], f"{stage_name} expected an error status, got {results_dict['status']}"
+            assert results_dict["error"] is not None, f"{stage_name} expected an error message"
+        else:
+            assert "Error" not in results_dict["status"], f"{stage_name} had unexpected error: {results_dict['status']} - {results_dict['error']}"
+            assert expected_status_part in results_dict["status"], f"{stage_name} failed: status {results_dict['status']} does not contain {expected_status_part}"
+            if "Warning" not in results_dict["status"] and results_dict["status"] != "No_Action_Taken" and "Skipped" not in results_dict["status"]:
+                 assert results_dict["stages_processed"], f"{stage_name} ({results_dict['status']}) should have processed or skipped stages, but 'stages_processed' is empty."
+
+    # Test Case 1: Geometry Only (force_overwrite=True)
+    test_logger.info(f"--- Test Case 1: Geometry Only (force_overwrite=True) ---")
+    results_geom = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), force_overwrite=True, processing_stage="geometry"
     )
+    check_results(results_geom, "Completed_Geometry_Stage", "Test 1: Geometry Only")
+    assert Path(results_geom["stl_file"]).exists(), "STL file missing after geometry stage (Test 1)"
+    assert Path(results_geom["pointcloud_file"]).exists(), "Point cloud missing after geometry stage (Test 1)"
+    assert not results_geom["render_files"], "Render files should not exist after geometry stage (Test 1)"
+    assert "stl_generated" in results_geom["stages_processed"]
+    assert "pointcloud_generated" in results_geom["stages_processed"]
 
-    # Construct log message separately to avoid potential linter parsing issues with complex f-strings
-    log_message_content = json.dumps(result, indent=2)
-    log_message = f"Processing Result:\n{log_message_content}"
-    logger.info(log_message)
+    # Test Case 2: Render Only (force_overwrite=True, uses geometry from Test 1)
+    test_logger.info(f"--- Test Case 2: Render Only (force_overwrite=True, uses geometry from Test 1) ---")
+    results_render = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), force_overwrite=True, processing_stage="render"
+    )
+    check_results(results_render, "Completed_Render_Stage", "Test 2: Render Only")
+    assert Path(results_geom["stl_file"]).exists(), "STL file from geometry stage should still exist (Test 2)"
+    assert results_render["render_files"], "Render files should exist after render stage (Test 2)"
+    assert "render_generated" in results_render["stages_processed"]
+    for f_path in results_render["render_files"].values():
+        assert Path(f_path).exists(), f"Render file {f_path} should exist (Test 2)"
 
-    if result['success']:
-        logger.info(f"Test successful. Outputs should be in: {result.get('output_dir')}")
-    else:
-        logger.error(f"Test failed. Error: {result.get('error')}")
+    # Test Case 3: Geometry Only (force_overwrite=False, files exist)
+    test_logger.info(f"--- Test Case 3: Geometry Only (force_overwrite=False, files exist) ---")
+    results_geom_skip = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), force_overwrite=False, processing_stage="geometry"
+    )
+    check_results(results_geom_skip, "Completed_Geometry_Stage", "Test 3: Geometry Only (Skip)")
+    assert "stl_skipped_exists" in results_geom_skip["stages_processed"]
+    assert "pointcloud_skipped_exists" in results_geom_skip["stages_processed"]
 
-    # Optional: cleanup dummy files (manual for now)
-    # import shutil
-    # shutil.rmtree(dummy_cad_dir)
-    # shutil.rmtree(test_output_dir)
+    # Test Case 4: Render Only (force_overwrite=False, files exist)
+    test_logger.info(f"--- Test Case 4: Render Only (force_overwrite=False, files exist) ---")
+    results_render_skip = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), force_overwrite=False, processing_stage="render"
+    )
+    check_results(results_render_skip, "Completed_Render_Stage", "Test 4: Render Only (Skip)")
+    assert "render_skipped_exists" in results_render_skip["stages_processed"]
 
-    # If gpu_memory was available and initialized, consider cleanup
+    # Test Case 5: All Stages (force_overwrite=True, clean start)
+    test_logger.info(f"--- Test Case 5: All Stages (force_overwrite=True, clean start) ---")
+    shutil.rmtree(test_output_dir / input_batch_dir_name / dummy_script_path.stem) # Clean specific output subdir
+    results_all = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), force_overwrite=True, processing_stage="all"
+    )
+    check_results(results_all, "Completed_All_Stages", "Test 5: All Stages")
+    assert Path(results_all["stl_file"]).exists(), "STL file missing (Test 5)"
+    assert Path(results_all["pointcloud_file"]).exists(), "Point cloud missing (Test 5)"
+    assert results_all["render_files"], "Render files missing (Test 5)"
+    assert "stl_generated" in results_all["stages_processed"]
+    assert "pointcloud_generated" in results_all["stages_processed"]
+    assert "render_generated" in results_all["stages_processed"]
+
+    # Test Case 6: Render Only (STL missing)
+    test_logger.info(f"--- Test Case 6: Render Only (STL missing) ---")
+    shutil.rmtree(test_output_dir / input_batch_dir_name / dummy_script_path.stem) # Clean specific output subdir to remove STL
+    results_render_no_stl = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), processing_stage="render"
+    )
+    check_results(results_render_no_stl, "Error_Render_No_STL", "Test 6: Render Only (No STL)", expect_error=True)
+    assert not results_render_no_stl["render_files"], "Render files should not exist (Test 6)"
+
+    # Test Case 7: Geometry only (CadQuery to STL fails)
+    test_logger.info(f"--- Test Case 7: Geometry only (CadQuery to STL fails) ---")
+    faulty_cad_script_content = "import cadquery as cq\nresult = cq.Workplane('XY').circle(1).extrude('not_a_number') # This will fail"
+    faulty_script_path = test_dir / "faulty_box.py"
+    with open(faulty_script_path, "w") as f: f.write(faulty_cad_script_content)
+    
+    # Clean up specific output for faulty script if it exists from a previous failed run
+    faulty_output_subdir = test_output_dir / faulty_script_path.parent.name / faulty_script_path.stem
+    if faulty_output_subdir.exists():
+        shutil.rmtree(faulty_output_subdir)
+
+    results_geom_fail_stl = process_cad_file_sequentially(
+        str(faulty_script_path), str(test_output_dir), processing_stage="geometry"
+    )
+    check_results(results_geom_fail_stl, "Error_STL", "Test 7: Geometry (STL Fail)", expect_error=True)
+
+    # Test Case 8: All stages (force_overwrite=False, all files exist from Test 5 run)
+    test_logger.info(f"--- Test Case 8: All Stages (force_overwrite=False, files exist) ---")
+    # Re-run test 5 outputs
+    shutil.rmtree(test_output_dir / input_batch_dir_name / dummy_script_path.stem) # Clean specific output subdir
+    process_cad_file_sequentially( str(dummy_script_path), str(test_output_dir), force_overwrite=True, processing_stage="all") # Create all files
+    # Now run with force_overwrite=False
+    results_all_skip = process_cad_file_sequentially(
+        str(dummy_script_path), str(test_output_dir), force_overwrite=False, processing_stage="all"
+    )
+    check_results(results_all_skip, "Completed_Skipped_All_Exist_Or_Unavailable", "Test 8: All Stages (Skip)")
+    assert "stl_skipped_exists" in results_all_skip["stages_processed"]
+    assert "pointcloud_skipped_exists" in results_all_skip["stages_processed"]
+    assert "render_skipped_exists" in results_all_skip["stages_processed"]
+
+    test_logger.info("--- All single_file_processor stage tests completed. ---")
+    test_logger.info(f"Note: Test files and directories are in: {test_dir}")
+    test_logger.info("Consider manually deleting it if not needed further.")
+
+    # Cleanup GPU resources (if applicable and imported)
     if GPU_MEMORY_AVAILABLE:
         try:
-            from gpu_memory import cleanup_gpu_resources
-            logger.info("Attempting global GPU resource cleanup.")
-            cleanup_gpu_resources()
-            logger.info("Global GPU resource cleanup finished.")
-        except ImportError:
-            logger.warning("Could not import cleanup_gpu_resources.")
+            # from gpu_memory import cleanup_gpu_resources # Already imported if available
+            if 'cleanup_gpu_resources' in globals() or 'cleanup_gpu_resources' in locals():
+                test_logger.info("Attempting global GPU resource cleanup.")
+                cleanup_gpu_resources()
+                test_logger.info("Global GPU resource cleanup finished.")
+            else:
+                test_logger.warning("cleanup_gpu_resources not found in globals/locals despite GPU_MEMORY_AVAILABLE=True.")
+        except NameError: # Should be caught by the check above, but defensive
+             test_logger.warning("cleanup_gpu_resources not defined despite GPU_MEMORY_AVAILABLE=True.")
         except Exception as e:
-            logger.error(f"Error during GPU resource cleanup: {e}")
+            test_logger.error(f"Error during GPU resource cleanup: {e}")
 

@@ -14,7 +14,7 @@ from tqdm import tqdm
 
 # Assuming single_file_processor.py is in the same directory or accessible in PYTHONPATH
 try:
-    from single_file_processor import process_cad_file_sequentially
+    from single_file_processor import process_cad_file_sequentially, DEFAULT_VIEWS
     SINGLE_FILE_PROCESSOR_AVAILABLE = True
 except ImportError as e:
     print(f"Critical Error: Could not import 'process_cad_file_sequentially' from 'single_file_processor.py'. Error: {e}")
@@ -211,16 +211,23 @@ def main():
     parser = argparse.ArgumentParser(description="Batch process CadQuery files sequentially using single_file_processor.")
     parser.add_argument("--data-dir", nargs='+', required=True, help="Path(s) to the root directory(ies) containing CadQuery (.py) files. Can specify multiple.")
     parser.add_argument("--output-dir", required=True, help="Root directory for all processed outputs.")
-    parser.add_argument("--num-points", type=int, default=10000, help="Points per point cloud for each file.")
-    parser.add_argument("--image-width", type=int, default=1024, help="Width of rendered images.")
-    parser.add_argument("--image-height", type=int, default=1024, help="Height of rendered images.")
-    parser.add_argument("--force-overwrite", action="store_true", help="Overwrite existing output files for each CadQuery file.")
-    parser.add_argument("--use-global-lighting", action="store_true", help="Use global lighting for rendering instead of view-specific.")
-    parser.add_argument("--resume", action="store_true", help="Resume processing from the last saved progress.")
-    parser.add_argument("--log-level", default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Console logging level. Overridden by --quiet for console output.")
-    parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process (for testing).")
-    parser.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() // 2 if os.cpu_count() else 1), help="Number of parallel worker threads.")
+    parser.add_argument("--num-points", type=int, default=4096, help="Number of points for point cloud generation.")
+    parser.add_argument("--force-overwrite", action="store_true", help="Overwrite existing output files.")
+    parser.add_argument("--render-width", type=int, default=1024, help="Width of rendered images.")
+    parser.add_argument("--render-height", type=int, default=1024, help="Height of rendered images.")
+    parser.add_argument(
+        "--stage", 
+        type=str, 
+        default="all", 
+        choices=["all", "geometry", "render"],
+        help="Processing stage to execute: 'all', 'geometry' (STL & point cloud), or 'render' (requires existing STL)."
+    )
+    parser.add_argument("--log-level", type=str, default="INFO", choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"], help="Set the logging level.")
+    parser.add_argument("--num-workers", type=int, default=max(1, os.cpu_count() // 2), help="Number of worker processes for multiprocessing.")
     parser.add_argument("--quiet", action="store_true", help="Suppress terminal log output (except critical errors). Detailed logs are still saved to file.")
+    parser.add_argument("--views", type=str, default=None, help="Comma-separated list of views to render (e.g., 'iso,front,top'). Defaults to all standard views.")
+    parser.add_argument("--resume", action="store_true", help="Resume processing from the last saved progress.")
+    parser.add_argument("--max-files", type=int, default=None, help="Maximum number of files to process (for testing).")
 
     args = parser.parse_args()
 
@@ -235,6 +242,9 @@ def main():
     logger.info(f"  Data director(y/ies): {', '.join(args.data_dir)}")
     logger.info(f"  Output directory: {args.output_dir}")
     logger.info(f"  Force overwrite: {args.force_overwrite}")
+    logger.info(f"  Render width: {args.render_width}")
+    logger.info(f"  Render height: {args.render_height}")
+    logger.info(f"  Stage: {args.stage}")
     logger.info(f"  Resume: {args.resume}")
     if args.max_files is not None:
         logger.info(f"  Processing at most {args.max_files} files.")
@@ -269,76 +279,68 @@ def main():
         
     tracker.start_batch(files_to_process) # Inform tracker about the total for this run
 
-    image_size = (args.image_width, args.image_height)
+    image_size = (args.render_width, args.render_height)
 
     overall_start_time = time.time()
 
-    # Prepare partial function for process_cad_file_sequentially
-    # This is needed because Pool.map/imap only takes one iterable argument for the worker function.
-    # We set other relatively static arguments here.
-    process_func_partial = partial(
-        process_cad_file_sequentially,
-        base_output_dir=args.output_dir,
-        num_points=args.num_points,
-        image_size=image_size,
-        force_overwrite=args.force_overwrite,
-        use_global_lighting=args.use_global_lighting
-    )
+    # Prepare tasks for the pool
+    tasks = []
+    for cad_file_path in files_to_process:
+        # Create a partial function with all arguments for process_cad_file_sequentially
+        # except for the first one (cad_script_path), which will be supplied by pool.map
+        # Wrap the call to process_cad_file_sequentially to handle arguments correctly for starmap
+        task_args = (
+            str(cad_file_path),
+            args.output_dir,
+            tuple(args.views.split(',') if args.views else DEFAULT_VIEWS),
+            args.num_points,
+            args.force_overwrite,
+            args.render_width,
+            args.render_height,
+            args.stage # Pass the processing_stage argument
+        )
+        tasks.append(task_args)
 
-    try:
-        # Use multiprocessing.Pool for parallel processing
-        with Pool(processes=args.num_workers) as pool:
-            logger.info(f"Submitted {len(files_to_process)} files to the multiprocessing pool with {args.num_workers} workers.")
-            
-            results_iterator = pool.imap_unordered(process_func_partial, files_to_process)
-            
-            processed_count = 0
-            for result in tqdm(results_iterator, total=len(files_to_process), desc="Processing files", unit="file"):
-                processed_count += 1
-                # The result dict directly comes from process_cad_file_sequentially
-                cad_file_path_from_result = result.get('file', 'Unknown_file_path_from_result')
-                file_path_obj = Path(cad_file_path_from_result)
-
-                file_processing_time = result.get('processing_time', 0.0)
-
-                if result.get('success', False):
-                    logger.info(f"({processed_count}/{len(files_to_process)}) Successfully processed {file_path_obj.name} in {file_processing_time:.2f}s. Output: {result.get('output_dir')}")
-                    tracker.record_success(cad_file_path_from_result, file_processing_time)
-                else:
-                    error_msg = result.get('error', 'Unknown error from single_file_processor')
-                    logger.error(f"({processed_count}/{len(files_to_process)}) Failed to process {file_path_obj.name}. Error: {error_msg}")
-                    if result.get('traceback'):
-                        logger.debug(f"Traceback for {file_path_obj.name}:\n{result.get('traceback')}")
-                    tracker.record_failure(cad_file_path_from_result, error_msg, file_processing_time)
+    processed_count = 0
+    # Initialize tqdm progress bar
+    progress_bar_desc = f"Processing files ({args.stage} stage) with {args.num_workers} workers"
+    with tqdm(total=len(files_to_process), desc=progress_bar_desc, disable=args.quiet) as pbar:
+        try:
+            # Use starmap to pass multiple arguments to the worker function
+            # The process_cad_file_sequentially function itself is the target
+            with Pool(processes=args.num_workers) as pool:
+                logger.info(f"Submitted {len(files_to_process)} files to the multiprocessing pool with {args.num_workers} workers.")
                 
-                # No direct equivalent of future.exception() easily here unless we wrap calls,
-                # but process_cad_file_sequentially is designed to catch its own exceptions and return a dict.
+                for result in pool.starmap(process_cad_file_sequentially, tasks):
+                    tracker.log_result(result)
+                    processed_count += 1
+                    pbar.update(1)
+                    if result.get("error"): # Or check status for errors
+                        logger.error(f"Error processing {result.get('cad_file', 'Unknown file')}: {result.get('status', 'N/A')} - {result.get('error', 'N/A')}")
+                    else:
+                        logger.info(f"Successfully processed {result.get('cad_file', 'Unknown file')}. Status: {result.get('status', 'N/A')}")
 
-                if processed_count % 100 == 0: # Log summary every 100 processed files
-                    logger.info(f"--- Processed {processed_count}/{len(files_to_process)} files. Current progress: ---")
-                    logger.info(tracker.get_summary())
+        except KeyboardInterrupt:
+            logger.warning("Batch processing interrupted by user (KeyboardInterrupt). Terminating pool...")
+            # Pool is automatically terminated/joined by the context manager (__exit__)
+        except Exception as e_outer:
+            logger.critical(f"An unexpected error occurred during batch processing: {e_outer}", exc_info=True)
+        finally:
+            logger.info("Batch processing finished or was interrupted.")
+            tracker.complete_batch()
+            logger.info(tracker.get_summary())
+            
+            if GPU_MEMORY_CLEANUP_AVAILABLE:
+                logger.info("Attempting final GPU resource cleanup...")
+                try:
+                    cleanup_gpu_resources()
+                    logger.info("GPU resource cleanup successful.")
+                except Exception as e_cleanup:
+                    logger.error(f"Error during final GPU resource cleanup: {e_cleanup}")
 
-    except KeyboardInterrupt:
-        logger.warning("Batch processing interrupted by user (KeyboardInterrupt). Terminating pool...")
-        # Pool is automatically terminated/joined by the context manager (__exit__)
-    except Exception as e_outer:
-        logger.critical(f"An unexpected error occurred during batch processing: {e_outer}", exc_info=True)
-    finally:
-        logger.info("Batch processing finished or was interrupted.")
-        tracker.complete_batch()
-        logger.info(tracker.get_summary())
-        
-        if GPU_MEMORY_CLEANUP_AVAILABLE:
-            logger.info("Attempting final GPU resource cleanup...")
-            try:
-                cleanup_gpu_resources()
-                logger.info("GPU resource cleanup successful.")
-            except Exception as e_cleanup:
-                logger.error(f"Error during final GPU resource cleanup: {e_cleanup}")
-
-        overall_end_time = time.time()
-        logger.info(f"Total batch script execution time: {timedelta(seconds=(overall_end_time - overall_start_time))}")
-        logger.info(f"Log file saved to: {log_dir}")
+            overall_end_time = time.time()
+            logger.info(f"Total batch script execution time: {timedelta(seconds=(overall_end_time - overall_start_time))}")
+            logger.info(f"Log file saved to: {log_dir}")
 
 if __name__ == "__main__":
     if not SINGLE_FILE_PROCESSOR_AVAILABLE:
