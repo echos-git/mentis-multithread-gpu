@@ -118,6 +118,20 @@ def process_cad_file_sequentially(
         stl_output_path = stl_dir / f"{filename_no_ext}.stl"
         pointcloud_output_path = pointcloud_dir / f"{filename_no_ext}.npy"
 
+        # Initialize results dictionary HERE
+        results = {
+            "cad_file": cad_script_path,
+            "output_subdir": str(output_sub_dir),
+            "stl_file": str(stl_output_path), # Use defined stl_output_path
+            "pointcloud_file": str(pointcloud_output_path), # Use defined pointcloud_output_path
+            "render_files": {},
+            "status": "Scheduled", 
+            "stages_processed": [],
+            "error": None,
+            "traceback": None,
+            "processing_time_seconds": 0.0,
+        }
+
         logger.info(f"Processing {script_path_obj.name} -> {output_sub_dir} (Stage: {processing_stage})")
 
         # --- STAGE: GEOMETRY (STL and Point Cloud) ---
