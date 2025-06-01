@@ -240,20 +240,20 @@ def process_cad_file_sequentially(
                 try:
                     logger.info("Starting STL generation...")
                     stl_dir.mkdir(parents=True, exist_ok=True)
-                    generated_stl_path_str = _cq_to_stl_func( # Use the (potentially mock) function from module level
-                        script_path=cad_script_path,
-                        output_path=str(stl_file_path),
-                        object_name=None, 
-                        tolerance=0.1, 
-                        angular_tolerance=0.1,
-                        logger_name=logger.name
+                    # Call _cq_to_stl_func with positional arguments as defined in cadquerytostl.py
+                    _cq_to_stl_func(
+                        cad_script_path,       # First positional argument
+                        str(stl_file_path)     # Second positional argument
                     )
-                    if generated_stl_path_str and Path(generated_stl_path_str).exists():
-                        results["stl_file"] = generated_stl_path_str
-                        logger.info(f"STL file generated successfully: {generated_stl_path_str}")
+                    # After the call, we assume the file is created at stl_file_path if no error was raised.
+                    # The original cq_to_stl doesn't return a path, it just exports.
+                    if Path(stl_file_path).exists():
+                        results["stl_file"] = str(stl_file_path) # Confirm path
+                        logger.info(f"STL file generated successfully: {stl_file_path}")
                         results["stages_processed"].append("stl_generated")
                     else:
-                        raise RuntimeError(f"cq_to_stl did not return a valid path or file was not created: {generated_stl_path_str}")
+                        # This case should ideally be caught by an exception from _cq_to_stl_func if export fails
+                        raise RuntimeError(f"_cq_to_stl_func was called but target STL file was not created: {stl_file_path}")
                 except Exception as e:
                     logger.error(f"Error during STL generation for {filename_no_ext}: {e}")
                     logger.debug(traceback.format_exc())
