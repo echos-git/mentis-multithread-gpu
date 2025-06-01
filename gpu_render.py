@@ -222,7 +222,7 @@ class GPUBatchRenderer:
                                 output_base_dir: Union[str, Path],
                                 use_global_lighting: bool = False,
                                 force_overwrite: bool = False,
-                                views_to_render: Optional[List[str]] = None) -> Dict[str, str]:
+                                views: Optional[List[str]] = None) -> Dict[str, str]:
         """
         Render multiple views of an STL file using GPU acceleration.
         
@@ -231,7 +231,7 @@ class GPUBatchRenderer:
             output_base_dir: Base directory for rendered images
             use_global_lighting: Use global lighting setup
             force_overwrite: Overwrite existing images
-            views_to_render: Specific views to render (default: all 14)
+            views: Specific views to render (default: all 14)
             
         Returns:
             Dictionary mapping view names to output image paths
@@ -261,16 +261,25 @@ class GPUBatchRenderer:
             # Debug: Log viewpoint information
             self.logger.info(f"Calculated {len(viewpoints)} viewpoints: {list(viewpoints.keys())}")
             
-            # Filter views if specified
-            if views_to_render:
-                viewpoints = {k: v for k, v in viewpoints.items() if k in views_to_render}
+            # Determine views to process
+            all_canonical_views = GPUCanonicalViews.calculate_viewpoints(mesh.center, mesh.bounds, mesh.length)
+            
+            if views:
+                viewpoints_to_process = {view: params for view, params in all_canonical_views.items() if view in views}
+                if not viewpoints_to_process:
+                    self.logger.warning(f"Specified views not found in canonical set: {views}. Defaulting to all views.")
+                    viewpoints_to_process = all_canonical_views
+            else:
+                viewpoints_to_process = all_canonical_views
+
+            self.logger.info(f"Rendering {len(viewpoints_to_process)} views for {stl_path}")
             
             # Prepare mesh for rendering (compute normals for better visualization)
             mesh.compute_normals(point_normals=True, cell_normals=False, inplace=True)
             
             # Render views in batches
             results = self._render_views_batched(
-                mesh, stl_path, viewpoints, output_dir, 
+                mesh, stl_path, viewpoints_to_process, output_dir, 
                 use_global_lighting, force_overwrite
             )
             

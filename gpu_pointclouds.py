@@ -44,14 +44,14 @@ class GPUPointCloudGenerator:
             self.logger.warning("No GPU acceleration available, falling back to CPU")
     
     def stl_to_pointcloud_gpu(self, 
-                             stl_path: Union[str, Path], 
+                             stl_file_path: Union[str, Path], 
                              n_points: int = 8192,
                              batch_size: Optional[int] = None) -> np.ndarray:
         """
         Convert STL file to point cloud using GPU acceleration.
         
         Args:
-            stl_path: Path to STL file
+            stl_file_path: Path to STL file
             n_points: Number of points to sample
             batch_size: Batch size for GPU processing (auto-detected if None)
             
@@ -64,9 +64,9 @@ class GPUPointCloudGenerator:
         
         try:
             # Load mesh using trimesh (still CPU-based loading)
-            mesh = trimesh.load(stl_path)
+            mesh = trimesh.load(stl_file_path)
             if mesh is None:
-                raise ValueError(f"Failed to load mesh from {stl_path}")
+                raise ValueError(f"Failed to load mesh from {stl_file_path}")
             
             # Preprocess mesh (centering and scaling)
             mesh = self._preprocess_mesh(mesh)
@@ -80,9 +80,9 @@ class GPUPointCloudGenerator:
             return points
             
         except Exception as e:
-            self.logger.error(f"Failed to generate point cloud from {stl_path}: {e}")
+            self.logger.error(f"Failed to generate point cloud from {stl_file_path}: {e}")
             # Fallback to CPU method
-            return self._fallback_cpu_sampling(stl_path, n_points)
+            return self._fallback_cpu_sampling(stl_file_path, n_points)
         finally:
             # Cleanup
             if 'mesh' in locals():
@@ -365,34 +365,39 @@ class GPUPointCloudGenerator:
         # Default batch size
         return 8192
     
-    def _fallback_cpu_sampling(self, stl_path: Union[str, Path], n_points: int) -> np.ndarray:
-        """Fallback to CPU-only sampling."""
+    def _fallback_cpu_sampling(self, stl_file_path: Union[str, Path], n_points: int) -> np.ndarray:
+        """Fallback to CPU sampling if GPU fails."""
+        self.logger.warning(f"Falling back to CPU sampling for {stl_file_path}")
         try:
-            mesh = trimesh.load(stl_path)
+            mesh = trimesh.load(stl_file_path)
             mesh = self._preprocess_mesh(mesh)
             return self._sample_mesh_cpu(mesh, n_points)
         except Exception as e:
-            self.logger.error(f"Fallback CPU sampling failed for {stl_path}: {e}")
+            self.logger.error(f"Fallback CPU sampling failed for {stl_file_path}: {e}")
             # Return empty array as last resort
             return np.zeros((n_points, 3), dtype=np.float32)
 
 
-def stl_to_pointcloud_gpu(stl_path: Union[str, Path], 
+def stl_to_pointcloud_gpu(stl_file_path: Union[str, Path], 
                          n_points: int = 8192,
                          device_id: int = 0) -> np.ndarray:
     """
-    Convenience function for GPU-accelerated point cloud generation.
-    
+    Standalone function to convert STL to point cloud using GPU.
+
     Args:
-        stl_path: Path to STL file
-        n_points: Number of points to sample
-        device_id: GPU device ID to use
+        stl_file_path: Path to STL file
+        n_points: Number of points to sample.
+        device_id: GPU device ID.
         
     Returns:
         Point cloud as numpy array
     """
-    generator = GPUPointCloudGenerator(device_id=device_id)
-    return generator.stl_to_pointcloud_gpu(stl_path, n_points)
+    try:
+        generator = GPUPointCloudGenerator(device_id=device_id)
+        return generator.stl_to_pointcloud_gpu(stl_file_path, n_points)
+    except Exception as e:
+        logging.error(f"Error in standalone stl_to_pointcloud_gpu for {stl_file_path}: {e}")
+        return np.zeros((n_points, 3), dtype=np.float32)
 
 
 def batch_stl_to_pointclouds_gpu(stl_paths: list, 
