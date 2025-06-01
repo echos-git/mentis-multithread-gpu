@@ -312,13 +312,28 @@ def main():
                 logger.info(f"Submitted {len(files_to_process)} files to the multiprocessing pool with {args.num_workers} workers.")
                 
                 for result in pool.starmap(process_cad_file_sequentially, tasks):
-                    tracker.log_result(result)
+                    # cad_file_path_from_result = result.get('cad_file', 'Unknown_file_path_from_result')
+                    # file_processing_time = result.get('processing_time_seconds', 0.0)
+                    # error_message = result.get('error', 'Unknown error')
+                    # status = result.get('status', 'Unknown_Status')
+
+                    # Use specific tracker methods based on outcome
+                    if "Error" in result.get("status", "Error_Unknown"):
+                        tracker.record_failure(
+                            file_path=result.get("cad_file", "Unknown_File"),
+                            error_message=result.get("error", "Unknown error from worker"),
+                            processing_time=result.get("processing_time_seconds", 0.0)
+                        )
+                        logger.error(f"Error processing {result.get('cad_file', 'Unknown file')}: {result.get('status', 'N/A')} - {result.get('error', 'N/A')}")
+                    else: # Includes warnings, completed, skipped, etc.
+                        tracker.record_success(
+                            file_path=result.get("cad_file", "Unknown_File"),
+                            processing_time=result.get("processing_time_seconds", 0.0)
+                        )
+                        logger.info(f"Successfully processed {result.get('cad_file', 'Unknown file')}. Status: {result.get('status', 'N/A')}")
+                    
                     processed_count += 1
                     pbar.update(1)
-                    if result.get("error"): # Or check status for errors
-                        logger.error(f"Error processing {result.get('cad_file', 'Unknown file')}: {result.get('status', 'N/A')} - {result.get('error', 'N/A')}")
-                    else:
-                        logger.info(f"Successfully processed {result.get('cad_file', 'Unknown file')}. Status: {result.get('status', 'N/A')}")
 
         except KeyboardInterrupt:
             logger.warning("Batch processing interrupted by user (KeyboardInterrupt). Terminating pool...")
