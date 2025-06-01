@@ -29,6 +29,7 @@ import pyvista as pv
 
 from gpu_memory import get_gpu_manager
 
+print("DEBUG: Loading updated gpu_pointclouds.py with 'stl_file_path' parameter --- THIS IS THE CORRECT VERSION.")
 
 class GPUPointCloudGenerator:
     """GPU-accelerated point cloud generation from meshes."""

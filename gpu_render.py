@@ -1,3 +1,4 @@
+print("DEBUG: Loading updated gpu_render.py with 'views' parameter in GPUBatchRenderer signature --- THIS IS THE CORRECT VERSION.")
 """
 GPU-accelerated multi-view rendering system for STL meshes.
 Optimized for NVIDIA RTX A6000 with batch processing and parallel rendering.
