@@ -285,21 +285,23 @@ def process_cad_file_sequentially(
                 try:
                     logger.info("Starting point cloud generation...")
                     pointcloud_dir.mkdir(parents=True, exist_ok=True)
-                    pc_generator_manager = get_gpu_manager("pointcloud")
-                    with pc_generator_manager.get_generator() as pc_generator_instance:
+                    # pc_generator_manager = get_gpu_manager("pointcloud") # REMOVED
+                    # Instantiate _GPUPointCloudGenerator_class directly as it should be a context manager
+                    with _GPUPointCloudGenerator_class() as pc_generator_instance:
                         if pc_generator_instance is None: 
-                            # This path might be taken if get_gpu_manager returns a placeholder that yields None
-                            # or if the actual manager fails. The flag should ideally prevent this if generator truly unavailable.
+                            # This path might be taken if _GPUPointCloudGenerator_class is a mock that fails somehow, 
+                            # or if the real class constructor returns None (unlikely for a class instance).
+                            # The flag should ideally prevent trying to use it if it's truly unavailable.
                             if gpu_pointcloud_generator_available_flag: # If flag said it was available, this is an unexpected runtime failure
-                                raise RuntimeError("Failed to acquire PointCloudGenerator from manager, though availability flag was true.")
-                            else: # Flag already indicated not available, this is consistent, log and skip.
-                                logger.warning("PointCloudGenerator acquisition failed, consistent with availability flag being false.")
+                                raise RuntimeError("Failed to acquire/instantiate PointCloudGenerator, though availability flag was true.")
+                            else: # Flag already indicated not available, this is consistent.
+                                logger.warning("PointCloudGenerator instantiation failed, consistent with availability flag being false.")
                                 results["stages_processed"].append("pointcloud_skipped_no_generator_runtime")
                                 if "Error" not in results["status"]: results["status"] = "Warning_No_PointCloud_Generator"
                                 # Skip this specific try-block for point cloud generation
-                                pass 
+                                # No explicit 'pass' needed here, the 'else' for this if won't be hit.
                         else:
-                            logger.info(f"Using PointCloudGenerator: {pc_generator_instance}")
+                            logger.info(f"Using PointCloudGenerator instance: {pc_generator_instance}")
                             point_cloud_np = pc_generator_instance.stl_to_pointcloud_gpu(
                                 stl_file_path=results["stl_file"],
                                 num_points=num_points,
@@ -356,24 +358,24 @@ def process_cad_file_sequentially(
                 else:
                     try:
                         logger.info(f"Starting multi-view rendering for {stl_file_for_render.name}...")
-                        render_dir.mkdir(parents=True, exist_ok=True) # using render_dir
+                        render_dir.mkdir(parents=True, exist_ok=True)
                         
                         temp_render_output_base = output_sub_dir 
                         
-                        renderer_manager = get_gpu_manager("renderer")
-                        with renderer_manager.get_renderer() as renderer_instance:
+                        # renderer_manager = get_gpu_manager("renderer") # REMOVED
+                        # Instantiate _GPUBatchRenderer_class directly as it should be a context manager
+                        with _GPUBatchRenderer_class() as renderer_instance:
                             if renderer_instance is None:
                                 if gpu_batch_renderer_available_flag:
-                                    raise RuntimeError("Failed to acquire GPUBatchRenderer from manager, though availability flag was true.")
+                                    raise RuntimeError("Failed to acquire/instantiate GPUBatchRenderer, though availability flag was true.")
                                 else:
-                                    logger.warning("GPUBatchRenderer acquisition failed, consistent with availability flag being false.")
+                                    logger.warning("GPUBatchRenderer instantiation failed, consistent with availability flag being false.")
                                     results["stages_processed"].append("render_skipped_no_generator_runtime")
                                     if "Error" not in results["status"] and "Warning" not in results["status"]:
                                         results["status"] = "Warning_No_Render_Generator"
-                                    # Skip this specific try-block for rendering
-                                    pass
+                                    # No explicit 'pass' needed here.
                             else:
-                                logger.info(f"Using GPUBatchRenderer: {renderer_instance}")
+                                logger.info(f"Using GPUBatchRenderer instance: {renderer_instance}")
                                 renderer_instance.render_stl_multiview_gpu(
                                     stl_file_paths=[str(stl_file_for_render)],
                                     output_dir=str(temp_render_output_base),
