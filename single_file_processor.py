@@ -285,32 +285,41 @@ def process_cad_file_sequentially(
                 try:
                     logger.info("Starting point cloud generation...")
                     pointcloud_dir.mkdir(parents=True, exist_ok=True)
+                    
                     # pc_generator_manager = get_gpu_manager("pointcloud") # REMOVED
                     # Instantiate _GPUPointCloudGenerator_class directly as it should be a context manager
-                    with _GPUPointCloudGenerator_class() as pc_generator_instance:
-                        if pc_generator_instance is None: 
-                            # This path might be taken if _GPUPointCloudGenerator_class is a mock that fails somehow, 
-                            # or if the real class constructor returns None (unlikely for a class instance).
-                            # The flag should ideally prevent trying to use it if it's truly unavailable.
-                            if gpu_pointcloud_generator_available_flag: # If flag said it was available, this is an unexpected runtime failure
+                    # MODIFICATION: _GPUPointCloudGenerator_class is NOT a context manager.
+                    pc_generator_instance = None # Initialize for broader scope
+                    if gpu_pointcloud_generator_available_flag:
+                        try:
+                            pc_generator_instance = _GPUPointCloudGenerator_class() # Assuming default device_id or it handles it internally
+                            
+                            if pc_generator_instance is None: 
                                 raise RuntimeError("Failed to acquire/instantiate PointCloudGenerator, though availability flag was true.")
-                            else: # Flag already indicated not available, this is consistent.
-                                logger.warning("PointCloudGenerator instantiation failed, consistent with availability flag being false.")
-                                results["stages_processed"].append("pointcloud_skipped_no_generator_runtime")
-                                if "Error" not in results["status"]: results["status"] = "Warning_No_PointCloud_Generator"
-                                # Skip this specific try-block for point cloud generation
-                                # No explicit 'pass' needed here, the 'else' for this if won't be hit.
-                        else:
+                            
                             logger.info(f"Using PointCloudGenerator instance: {pc_generator_instance}")
                             point_cloud_np = pc_generator_instance.stl_to_pointcloud_gpu(
                                 stl_file_path=results["stl_file"],
-                                num_points=num_points,
-                                device_id=0
+                                num_points=num_points # device_id is likely handled by its constructor or defaults
                             )
-                    np.save(pointcloud_file_path, point_cloud_np)
-                    logger.info(f"Point cloud generated and saved: {pointcloud_file_path}")
-                    results["stages_processed"].append("pointcloud_generated")
-                except Exception as e:
+                            np.save(pointcloud_file_path, point_cloud_np)
+                            logger.info(f"Point cloud generated and saved: {pointcloud_file_path}")
+                            results["stages_processed"].append("pointcloud_generated")
+                        except Exception as pc_instance_error: # More specific catch for this block
+                            logger.error(f"Error during point cloud operation with instance for {filename_no_ext}: {pc_instance_error}")
+                            logger.debug(traceback.format_exc())
+                            results["status"] = "Error_PointCloud_Instance" # New status for this case
+                            results["error"] = str(pc_instance_error)
+                            results["traceback"] = traceback.format_exc()
+                            if processing_stage == "geometry": # If only doing geometry, this is a terminal error for the stage
+                                results["processing_time_seconds"] = time.time() - function_start_time
+                                return results
+                    else: # gpu_pointcloud_generator_available_flag is False
+                        logger.warning("GPUPointCloudGenerator not available (flag). Skipping point cloud generation.")
+                        results["stages_processed"].append("pointcloud_skipped_no_generator")
+                        if "Error" not in results["status"]: results["status"] = "Warning_No_PointCloud_Generator"
+                
+                except Exception as e: # Catch broader instantiation errors or other issues if the above try fails early
                     logger.error(f"Error during point cloud generation for {filename_no_ext}: {e}")
                     logger.debug(traceback.format_exc())
                     results["status"] = "Error_PointCloud"
@@ -356,64 +365,100 @@ def process_cad_file_sequentially(
                     if "Error" not in results["status"] and "Warning" not in results["status"]:
                         results["status"] = "Warning_No_Render_Generator"
                 else:
+                    # Instantiate _GPUBatchRenderer_class directly as it should be a context manager
+                    # MODIFICATION: _GPUBatchRenderer_class is NOT a context manager, but has cleanup()
+                    renderer_instance = None # Initialize before try for finally block access
                     try:
                         logger.info(f"Starting multi-view rendering for {stl_file_for_render.name}...")
                         render_dir.mkdir(parents=True, exist_ok=True)
                         
-                        temp_render_output_base = output_sub_dir 
+                        temp_render_output_base = output_sub_dir # This variable is not actually used below with the new logic
                         
-                        # renderer_manager = get_gpu_manager("renderer") # REMOVED
-                        # Instantiate _GPUBatchRenderer_class directly as it should be a context manager
-                        with _GPUBatchRenderer_class() as renderer_instance:
-                            if renderer_instance is None:
-                                if gpu_batch_renderer_available_flag:
-                                    raise RuntimeError("Failed to acquire/instantiate GPUBatchRenderer, though availability flag was true.")
-                                else:
-                                    logger.warning("GPUBatchRenderer instantiation failed, consistent with availability flag being false.")
-                                    results["stages_processed"].append("render_skipped_no_generator_runtime")
-                                    if "Error" not in results["status"] and "Warning" not in results["status"]:
-                                        results["status"] = "Warning_No_Render_Generator"
-                                    # No explicit 'pass' needed here.
-                            else:
-                                logger.info(f"Using GPUBatchRenderer instance: {renderer_instance}")
-                                renderer_instance.render_stl_multiview_gpu(
-                                    stl_file_paths=[str(stl_file_for_render)],
-                                    output_dir=str(temp_render_output_base),
-                                    views=views,
-                                    image_width=render_width,
-                                    image_height=render_height,
-                                    device_id=0
-                                )
+                        # Instantiate _GPUBatchRenderer_class directly
+                        renderer_instance = _GPUBatchRenderer_class(image_size=(render_width, render_height)) # device_id is handled by its constructor
 
-                        source_render_subdir = temp_render_output_base / "renders" / filename_no_ext
-                        if source_render_subdir.exists() and source_render_subdir.is_dir():
-                            logger.info(f"Moving renders from {source_render_subdir} to {render_dir}") # using render_dir
-                            for view_file in source_render_subdir.glob("*.png"):
-                                target_file_path = render_dir / view_file.name # using render_dir
+                        if renderer_instance is None:
+                            raise RuntimeError("Failed to acquire/instantiate GPUBatchRenderer, though availability flag was true.")
+                        
+                        logger.info(f"Using GPUBatchRenderer instance: {renderer_instance}")
+
+                        # GPUBatchRenderer writes to: Path(output_base_dir_arg) / stl_name / view.png
+                        # Our final renders should be in `render_dir` (e.g., .../output_sub_dir/renders).
+                        # So, we tell GPUBatchRenderer to use `render_dir` as its `output_base_dir` argument.
+                        # It will then create `render_dir / filename_no_ext / view.png`.
+                        renderer_output_base_for_this_call = render_dir
+
+                        renderer_instance.render_stl_multiview_gpu(
+                            stl_path=str(stl_file_for_render),
+                            output_base_dir=str(renderer_output_base_for_this_call), # This becomes the base for (base/stl_name)
+                            views=views,
+                            # image_width and image_height are passed to GPUBatchRenderer constructor
+                            # device_id is handled by its constructor
+                            force_overwrite=force_overwrite # Pass through force_overwrite for renderer's internal logic
+                        )
+
+                        # Source for moving files is now `render_dir / filename_no_ext`
+                        # Target is `render_dir` itself (files will be moved one level up).
+                        source_render_subdir_after_gpu_render = renderer_output_base_for_this_call / filename_no_ext
+                        
+                        if source_render_subdir_after_gpu_render.exists() and source_render_subdir_after_gpu_render.is_dir():
+                            logger.info(f"Moving renders from {source_render_subdir_after_gpu_render} to {render_dir}")
+                            files_moved_count = 0
+                            for view_file in source_render_subdir_after_gpu_render.glob("*.png"):
+                                target_file_path = render_dir / view_file.name
+                                # Handle overwrite for the move operation itself
+                                if target_file_path.exists() and force_overwrite:
+                                    try:
+                                        target_file_path.unlink()
+                                        logger.debug(f"Unlinked existing target render file for overwrite: {target_file_path}")
+                                    except OSError as e_unlink:
+                                        logger.warning(f"Could not unlink existing target render file {target_file_path} for overwrite: {e_unlink}")
+                                elif target_file_path.exists() and not force_overwrite:
+                                    logger.debug(f"Target render file {target_file_path} exists, not overwriting during move.")
+                                    # Add to render_files dict if it exists and we are not overwriting
+                                    results["render_files"][view_file.stem] = str(target_file_path)
+                                    continue # Skip moving this one
+
                                 shutil.move(str(view_file), str(target_file_path))
                                 results["render_files"][view_file.stem] = str(target_file_path)
                                 logger.debug(f"Moved {view_file} to {target_file_path}")
+                                files_moved_count +=1
                             
-                            try:
-                                source_render_subdir.rmdir()
-                                if not any((temp_render_output_base / "renders").iterdir()):
-                                    (temp_render_output_base / "renders").rmdir()
-                            except OSError as e:
-                                logger.warning(f"Could not clean up temporary render directory {source_render_subdir} or its parent: {e}")
+                            if files_moved_count == 0 and not any(render_dir.glob("*.png")):
+                                logger.warning(f"No PNG files were moved from {source_render_subdir_after_gpu_render}, and target {render_dir} is empty.")
+                            
+                            try: # Cleanup the temporary directory created by GPUBatchRenderer
+                                if list(source_render_subdir_after_gpu_render.iterdir()):
+                                    logger.warning(f"Temporary render source directory {source_render_subdir_after_gpu_render} is not empty after moving files. Contents: {list(source_render_subdir_after_gpu_render.iterdir())}")
+                                else:
+                                    source_render_subdir_after_gpu_render.rmdir()
+                                    logger.info(f"Cleaned up temporary render source directory {source_render_subdir_after_gpu_render}")
+                            except OSError as e_rmdir:
+                                logger.warning(f"Could not clean up temporary render source directory {source_render_subdir_after_gpu_render}: {e_rmdir}")
                         else:
-                            logger.warning(f"Expected source render directory {source_render_subdir} not found after rendering.")
-                            if "Error" not in results["status"] and "Warning" not in results["status"]:
-                                results["status"] = "Warning_Render_Output_Missing"
+                            logger.warning(f"Expected source render directory {source_render_subdir_after_gpu_render} not found or not a directory after rendering operation.")
+                            # If the source dir wasn't even created, it's a sign of a deeper issue with rendering output.
+                            if not any(render_dir.glob("*.png")):
+                                if "Error" not in results["status"] and "Warning" not in results["status"]:
+                                    results["status"] = "Warning_Render_Output_Missing"
                         
                         logger.info(f"Rendering completed for {filename_no_ext}.")
                         results["stages_processed"].append("render_generated")
 
-                    except Exception as e:
-                        logger.error(f"Error during rendering for {filename_no_ext}: {e}")
+                    except Exception as e_render_inst:
+                        logger.error(f"Error during rendering operation with instance for {filename_no_ext}: {e_render_inst}")
                         logger.debug(traceback.format_exc())
-                        results["status"] = "Error_Render"
-                        results["error"] = str(e)
+                        results["status"] = "Error_Render_Instance" # New status
+                        results["error"] = str(e_render_inst)
                         results["traceback"] = traceback.format_exc()
+                    finally:
+                        if renderer_instance and hasattr(renderer_instance, 'cleanup'):
+                            logger.info(f"Cleaning up GPUBatchRenderer instance for {filename_no_ext}...")
+                            try:
+                                renderer_instance.cleanup()
+                                logger.info(f"GPUBatchRenderer instance for {filename_no_ext} cleaned up.")
+                            except Exception as e_cleanup:
+                                logger.error(f"Error during GPUBatchRenderer cleanup for {filename_no_ext}: {e_cleanup}")
 
         # --- Final Status Determination ---
         if "Error" in results["status"]:

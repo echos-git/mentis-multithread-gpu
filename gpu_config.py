@@ -79,7 +79,11 @@ class GPUConfigManager:
             
             for i in range(device_count):
                 handle = pynvml.nvmlDeviceGetHandleByIndex(i)
-                name = pynvml.nvmlDeviceGetName(handle).decode('utf-8')
+                raw_name = pynvml.nvmlDeviceGetName(handle)
+                if isinstance(raw_name, bytes):
+                    name = raw_name.decode('utf-8')
+                else:
+                    name = raw_name # Assume it's already a str
                 
                 # Memory info
                 mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
